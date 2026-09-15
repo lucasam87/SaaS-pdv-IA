@@ -1,0 +1,65 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Função auxiliar para verificar se o usuário está autenticado
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Função para verificar se o usuário pertence a este tenant
+    function belongsToTenant(tenantId) {
+      return isAuthenticated() && 
+        (request.auth.token.tenantId == tenantId || 
+         request.auth.uid == tenantId);
+    }
+
+    // Regras Multi-Tenant: Todo recurso reside sob tenants/{tenantId}
+    match /tenants/{tenantId} {
+      // Dono do tenant ou membro autorizado pode ler/gravar o perfil
+      allow read: if isAuthenticated() && (request.auth.token.tenantId == tenantId || request.auth.uid == tenantId);
+      allow write: if isAuthenticated() && (request.auth.token.tenantId == tenantId || request.auth.uid == tenantId);
+
+      // Usuários/operadores da loja
+      match /users/{userId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+
+      // Catálogo de Produtos e Lotes (6.000 itens)
+      match /products/{productId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+
+      match /lots/{lotId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+
+      // Sessões de Caixa e Movimentações
+      match /cash_sessions/{sessionId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+
+      match /cash_movements/{movementId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+
+      // Vendas
+      match /sales/{saleId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+
+      // Resumos Diários e Diagnósticos da IA
+      match /daily_summaries/{summaryId} {
+        allow read: if belongsToTenant(tenantId);
+        // Escrita restrita a Cloud Functions (Service Account) ou Admin do Tenant
+        allow write: if belongsToTenant(tenantId);
+      }
+
+      // Contas a Pagar
+      match /accounts_payable/{billId} {
+        allow read, write: if belongsToTenant(tenantId);
+      }
+    }
+  }
+}

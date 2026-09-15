@@ -1,0 +1,19 @@
+{
+  "name": "pdv-smart-store-root",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SaaS de Gestão Comercial e PDV Inteligente com IA para Pequeno Varejo",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "functions"
+  ],
+  "scripts": {
+    "dev:desktop": "npm --workspace=@pdv/desktop run dev",
+    "dev:web": "npm --workspace=@pdv/web run dev",
+    "build:shared": "npm --workspace=@pdv/shared run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

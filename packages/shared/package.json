@@ -1,0 +1,13 @@
+{
+  "name": "@pdv/shared",
+  "version": "1.0.0",
+  "description": "Modelos de dados e tipos TypeScript compartilhados entre Desktop, Web e Funções",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}
