@@ -48,5 +48,6 @@ export interface StockMovement {
   reason?: string;
   userId: string;
   userName: string;
+  deviceId?: string; // Terminal que gerou a movimentação
   createdAt: number;
 }

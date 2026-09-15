@@ -5,3 +5,5 @@ export * from './models/cash';
 export * from './models/sale';
 export * from './models/report';
 export * from './models/import-export';
+export * from './models/device';
+export * from './models/signals';

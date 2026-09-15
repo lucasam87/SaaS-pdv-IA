@@ -25,6 +25,7 @@ export interface Sale {
   id: string;
   tenantId: string;
   sessionId: string;
+  deviceId: string; // Identificador do terminal (ex: "caixa-01", "caixa-02")
   saleNumber: number; // Sequencial simples da loja
   userId: string;
   userName: string;

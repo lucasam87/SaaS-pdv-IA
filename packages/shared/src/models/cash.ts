@@ -4,6 +4,7 @@ export interface CashSession {
   id: string;
   tenantId: string;
   terminalNumber: number;
+  deviceId: string; // ex: "caixa-01", "caixa-02"
   openedByUserId: string;
   openedByName: string;
   openedAt: number;

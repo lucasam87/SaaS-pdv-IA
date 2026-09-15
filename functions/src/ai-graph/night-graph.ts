@@ -15,6 +15,21 @@ export interface ExecuteNightGraphParams {
     credit: number;
   };
   cashDifference: number;
+  deviceSessions?: Array<{
+    deviceId: string;
+    deviceName: string;
+    terminalNumber: number;
+    openedByName: string;
+    totalSales: number;
+    cashDifference: number;
+    status: string;
+  }>;
+  stockConflicts?: Array<{
+    productName: string;
+    barcode: string;
+    negativeBalance: number;
+    deviceIds: string[];
+  }>;
   topSelling: Array<{ productId: string; name: string; quantity: number; revenue: number }>;
   outOfStock: Array<{ productId: string; name: string; barcode: string }>;
   expiringLots: Array<{ productId: string; productName: string; lotNumber: string; expirationDate: string; daysRemaining: number; quantity: number }>;
@@ -40,6 +55,8 @@ export async function executeNightGraph(
     totalRevenue: params.totalRevenue,
     revenueByMethod: params.revenueByMethod,
     cashDifference: params.cashDifference,
+    deviceSessions: params.deviceSessions,
+    stockConflicts: params.stockConflicts,
     topSelling: params.topSelling,
     outOfStock: params.outOfStock,
     expiringLots: params.expiringLots,

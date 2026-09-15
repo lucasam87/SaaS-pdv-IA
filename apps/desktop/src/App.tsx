@@ -7,6 +7,8 @@ import { CashSessionModal } from './components/CashSessionModal';
 import { ShortcutsBar } from './components/ShortcutsBar';
 import { localDb } from './db/local-db';
 import { ThermalPrinterService } from './services/printer-usb';
+import { DeviceConfigService } from './services/device-config';
+import { SaleWriterService } from './services/sale-writer';
 import { Product, Sale, SaleItem, SalePayment, CashSession, TenantSettings } from '@pdv/shared';
 import { CheckCircle } from 'lucide-react';
 
@@ -20,12 +22,16 @@ const DEFAULT_SETTINGS: TenantSettings = {
 };
 
 export const App: React.FC = () => {
+  // Identificação do Terminal (Dispositivo)
+  const [deviceConfig] = useState(() => DeviceConfigService.getConfig());
+
   // Estado do Caixa
   const [currentSession, setCurrentSession] = useState<CashSession | null>(() => {
     return {
       id: 'session_001',
       tenantId: DEMO_TENANT_ID,
-      terminalNumber: 1,
+      terminalNumber: DeviceConfigService.getConfig().terminalNumber,
+      deviceId: DeviceConfigService.getConfig().deviceId,
       openedByUserId: 'user_01',
       openedByName: 'Lucas (Operador)',
       openedAt: Date.now(),
@@ -172,6 +178,7 @@ export const App: React.FC = () => {
       tenantId: DEMO_TENANT_ID,
       sessionId: currentSession?.id || 'session_001',
       saleNumber,
+      deviceId: deviceConfig.deviceId,
       userId: 'user_01',
       userName: 'Lucas (Operador)',
       customerName,
@@ -185,12 +192,12 @@ export const App: React.FC = () => {
       createdAt: Date.now(),
     };
 
-    // 1. Grava no banco local instantaneamente (< 2ms)
-    localDb.recordLocalSale(newSale);
+    // 1. Processa a venda aplicando estratégia Online-First com Fallback local
+    const writeResult = await SaleWriterService.processSale(newSale, isOnline);
     setPendingSyncCount(localDb.getPendingSales().length);
 
     // 2. Dispara a impressão na impressora térmica USB
-    await ThermalPrinterService.printSaleReceipt(newSale, {
+    await ThermalPrinterService.printSaleReceipt(writeResult.sale, {
       storeName: 'Mercearia Central',
       storeCnpj: '12.345.678/0001-90',
       settings: DEFAULT_SETTINGS,
@@ -218,7 +225,8 @@ export const App: React.FC = () => {
     // 4. Limpa e prepara o caixa para o próximo cliente
     setIsPaymentModalOpen(false);
     handleNewSale();
-    showToast(`Venda #${saleNumber} concluída e cupom enviado à impressora!`);
+    const modeBadge = writeResult.mode === 'ONLINE_TRANSACTION' ? '✅ Nuvem' : '⚡ Fila Local';
+    showToast(`Venda #${saleNumber} concluída [${modeBadge}] e impressa!`);
   };
 
   // Gestão de Caixa (Abertura, Fechamento, Sangria)
@@ -226,7 +234,8 @@ export const App: React.FC = () => {
     setCurrentSession({
       id: `session_${Date.now()}`,
       tenantId: DEMO_TENANT_ID,
-      terminalNumber: 1,
+      terminalNumber: deviceConfig.terminalNumber,
+      deviceId: deviceConfig.deviceId,
       openedByUserId: 'user_01',
       openedByName: 'Lucas (Operador)',
       openedAt: Date.now(),
@@ -239,7 +248,7 @@ export const App: React.FC = () => {
       totalSuprimentos: 0,
       status: 'OPEN',
     });
-    showToast(`Caixa aberto com sucesso! Fundo de troco: R$ ${initialAmount.toFixed(2)}`);
+    showToast(`Caixa aberto no [${deviceConfig.deviceName}]! Troco: R$ ${initialAmount.toFixed(2)}`);
   };
 
   const handleCloseSession = (finalReported: number, notes?: string) => {
@@ -296,6 +305,8 @@ export const App: React.FC = () => {
       {/* Header Principal */}
       <Header
         storeName="Mercearia Central"
+        deviceId={deviceConfig.deviceId}
+        deviceName={deviceConfig.deviceName}
         currentUser={{ name: 'Lucas', role: 'Operador' }}
         currentSession={currentSession}
         isOnline={isOnline}

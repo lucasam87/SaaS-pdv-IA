@@ -4,6 +4,8 @@ import { CashSession } from '@pdv/shared';
 
 interface HeaderProps {
   storeName: string;
+  deviceId: string;
+  deviceName: string;
   currentUser: { name: string; role: string };
   currentSession: CashSession | null;
   isOnline: boolean;
@@ -14,6 +16,8 @@ interface HeaderProps {
 
 export const Header: React.FC<HeaderProps> = ({
   storeName,
+  deviceId,
+  deviceName,
   currentUser,
   currentSession,
   isOnline,
@@ -30,7 +34,9 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
         <div>
           <h1 className="font-bold text-lg text-slate-100 leading-tight">{storeName}</h1>
-          <p className="text-xs text-slate-400 font-medium">PDV Inteligente • Terminal #01</p>
+          <p className="text-xs text-slate-400 font-medium">
+            {deviceName} <span className="font-mono text-emerald-400">[{deviceId}]</span>
+          </p>
         </div>
       </div>
 
