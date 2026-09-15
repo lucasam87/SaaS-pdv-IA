@@ -5,9 +5,11 @@ import { sendTelegramNotification } from './telegram-notifier';
 export interface ExecuteNightGraphParams {
   tenant: Tenant;
   geminiApiKey: string;
+  telegramBotToken?: string;
   dateStr: string;
   salesCount: number;
   totalRevenue: number;
+  totalCost?: number;
   revenueByMethod: {
     cash: number;
     pix: number;
@@ -63,19 +65,25 @@ export async function executeNightGraph(
     upcomingBills: params.upcomingBills,
   };
 
-  // 2. Chama o Gemini 1.5 Flash para gerar a síntese executiva
+  // 2. Chama a IA para gerar a síntese executiva
   const diagnosisMarkdown = await generateNightDiagnosisWithGemini(geminiApiKey, context);
 
-  // 3. Monta o objeto oficial de Resumo Diário
+  // 3. Cálculo Financeiro Real (sem margem fixa hardcoded nem custo zero fictício)
+  const totalCost = params.totalCost ?? 0;
+  const grossProfit = params.totalRevenue - totalCost;
+  const grossMarginPercentage =
+    params.totalRevenue > 0 ? (grossProfit / params.totalRevenue) * 100 : 0;
+
+  // 4. Monta o objeto oficial de Resumo Diário
   const dailySummary: DailySummary = {
     id: dateStr,
     tenantId: tenant.id,
     date: dateStr,
     totalSalesCount: params.salesCount,
     totalRevenue: params.totalRevenue,
-    totalCost: 0,
-    grossProfit: params.totalRevenue * 0.35, // Estimativa de margem
-    grossMarginPercentage: 35.0,
+    totalCost,
+    grossProfit,
+    grossMarginPercentage,
     averageTicket: params.salesCount > 0 ? params.totalRevenue / params.salesCount : 0,
     revenueByMethod: {
       cash: params.revenueByMethod.cash,
@@ -100,28 +108,28 @@ export async function executeNightGraph(
       name: o.name,
       barcode: o.barcode,
     })),
-    expiringProducts: params.expiringLots,
+    expiringProducts: params.expiringLots.map((e) => ({
+      productId: e.productId,
+      productName: e.productName,
+      lotNumber: e.lotNumber,
+      expirationDate: e.expirationDate,
+      daysRemaining: e.daysRemaining,
+      quantity: e.quantity,
+    })),
     nightAnalysisMarkdown: diagnosisMarkdown,
     createdAt: Date.now(),
   };
 
-  // 4. Se o lojista configurou o Telegram, despacha a notificação
-  if (
-    tenant.settings.enableTelegramAlerts &&
-    tenant.settings.telegramBotToken &&
-    tenant.settings.telegramChatId
-  ) {
-    console.log(`[Grafo Noturno] Enviando resumo para o Telegram Chat: ${tenant.settings.telegramChatId}`);
-    const sent = await sendTelegramNotification(
-      tenant.settings.telegramBotToken,
-      tenant.settings.telegramChatId,
-      diagnosisMarkdown
-    );
-    if (sent) {
-      dailySummary.telegramSentAt = Date.now();
+  // 5. Envia briefing noturno para o Telegram do dono da loja (se configurado)
+  const botToken = params.telegramBotToken;
+  if (tenant.settings.enableTelegramAlerts && tenant.settings.telegramChatId && botToken) {
+    try {
+      await sendTelegramNotification(botToken, tenant.settings.telegramChatId, diagnosisMarkdown);
+      console.log(`[Grafo Noturno] Notificação enviada para o Telegram (${tenant.settings.telegramChatId}) com sucesso.`);
+    } catch (telegramErr) {
+      console.error('[Grafo Noturno] Erro ao enviar mensagem no Telegram:', telegramErr);
     }
   }
 
-  console.log(`[Grafo Noturno] Auditoria concluída com sucesso!`);
   return dailySummary;
 }

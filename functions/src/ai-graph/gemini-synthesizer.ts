@@ -35,14 +35,23 @@ export interface StoreAuditContext {
   upcomingBills: Array<{ description: string; amount: number }>;
 }
 
+export interface GeminiSynthesizerOptions {
+  model?: string;
+  timeoutMs?: number;
+}
+
 /**
- * Síntese da IA Gerente usando Gemini 1.5 Flash.
- * Transforma números matemáticos exatos em um resumo executivo acionável para o lojista.
+ * Síntese da IA Gerente usando a API oficial do Google Gemini.
+ * Transforma números matemáticos consolidados em um briefing executivo para o lojista.
  */
 export async function generateNightDiagnosisWithGemini(
   apiKey: string,
-  context: StoreAuditContext
+  context: StoreAuditContext,
+  options?: GeminiSynthesizerOptions
 ): Promise<string> {
+  const model = options?.model || 'gemini-2.5-flash';
+  const timeoutMs = options?.timeoutMs || 15000;
+
   const prompt = `
 Você é o "Gerente Inteligente" da loja "${context.storeName}". 
 O caixa acabou de ser fechado na data de ${context.dateStr}.
@@ -108,11 +117,20 @@ INSTRUÇÕES DE RESPOSTA:
 8. Seja direto, fale como um consultor de varejo parceiro do comerciante.
 `;
 
+  // Se a chave não for fornecida ou for de mock de teste
+  if (!apiKey || apiKey === 'MOCK_KEY_TEST' || apiKey.startsWith('MOCK_')) {
+    return generateFallbackBriefing(context);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
@@ -122,16 +140,27 @@ INSTRUÇÕES DE RESPOSTA:
       }),
     });
 
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`Gemini API HTTP ${response.status}: ${response.statusText}`);
+    }
+
     const result = await response.json();
     if (result.candidates && result.candidates[0]?.content?.parts?.[0]?.text) {
       return result.candidates[0].content.parts[0].text;
     }
 
     throw new Error('Formato de resposta inesperado do Gemini API');
-  } catch (err) {
-    console.error('[Gemini] Erro ao sintetizar análise noturna:', err);
-    // Fallback determinístico caso a API falhe ou não tenha chave configurada
-    return `
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    console.warn('[Gemini] Falha na chamada da IA, utilizando síntese matemática estruturada:', err?.message || err);
+    return generateFallbackBriefing(context);
+  }
+}
+
+function generateFallbackBriefing(context: StoreAuditContext): string {
+  return `
 🏪 *FECHAMENTO DO DIA — ${context.storeName}* (${context.dateStr})
 
 💰 *COMO FOI O DIA:*
@@ -145,5 +174,4 @@ INSTRUÇÕES DE RESPOSTA:
 
 Tenha um ótimo descanso!
 `.trim();
-  }
 }

@@ -8,7 +8,13 @@ export interface TenantSettings {
   maxDiscountPercentageAllowedForCashier: number;
   enableTelegramAlerts: boolean;
   telegramChatId?: string;
+  // telegramBotToken removido daqui para não vazar ao cliente no frontend
+}
+
+export interface TenantPrivateSecrets {
   telegramBotToken?: string;
+  geminiApiKey?: string;
+  updatedAt: number;
 }
 
 export interface Tenant {

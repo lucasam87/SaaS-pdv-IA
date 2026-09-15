@@ -15,50 +15,90 @@ service cloud.firestore {
          request.auth.uid == tenantId);
     }
 
+    // Verifica papel de administrador ou gerente
+    function isTenantAdmin(tenantId) {
+      return belongsToTenant(tenantId) &&
+        (request.auth.token.role == 'ADMIN' || 
+         request.auth.token.role == 'MANAGER' ||
+         request.auth.uid == tenantId);
+    }
+
     // Regras Multi-Tenant: Todo recurso reside sob tenants/{tenantId}
     match /tenants/{tenantId} {
-      // Dono do tenant ou membro autorizado pode ler/gravar o perfil
-      allow read: if isAuthenticated() && (request.auth.token.tenantId == tenantId || request.auth.uid == tenantId);
-      allow write: if isAuthenticated() && (request.auth.token.tenantId == tenantId || request.auth.uid == tenantId);
+      // Dono do tenant ou membro autorizado pode ler o perfil da loja
+      allow read: if belongsToTenant(tenantId);
+      // Alterações de cadastro da empresa restritas a Administradores
+      allow write: if isTenantAdmin(tenantId);
+
+      // Segredos e Chaves de API (Telegram / IA): BLOQUEADO para clientes.
+      // Acessível unicamente pelo Firebase Admin SDK (Cloud Functions / Backend).
+      match /private_config/{document=**} {
+        allow read, write: if false;
+      }
 
       // Usuários/operadores da loja
       match /users/{userId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        allow write: if isTenantAdmin(tenantId);
       }
 
-      // Catálogo de Produtos e Lotes (6.000 itens)
+      // Catálogo de Produtos e Lotes
       match /products/{productId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        // Operadores de caixa e admin podem ler; gravação restrita a admin/gerente
+        allow write: if isTenantAdmin(tenantId);
       }
 
       match /lots/{lotId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        allow write: if isTenantAdmin(tenantId);
       }
 
       // Sessões de Caixa e Movimentações
       match /cash_sessions/{sessionId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        // Operadores e gerentes podem abrir e fechar sessões
+        allow create, update: if belongsToTenant(tenantId);
+        allow delete: if false;
       }
 
       match /cash_movements/{movementId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        allow create: if belongsToTenant(tenantId);
+        allow update, delete: if false;
       }
 
-      // Vendas
+      // Vendas: Imutáveis após registro. Clientes não podem deletar nem alterar vendas passadas.
       match /sales/{saleId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        allow create: if belongsToTenant(tenantId);
+        allow update, delete: if false;
       }
 
-      // Resumos Diários e Diagnósticos da IA
+      // Barreira de Idempotência de Operações
+      match /operations/{operationId} {
+        allow read: if belongsToTenant(tenantId);
+        allow create: if belongsToTenant(tenantId);
+        allow update, delete: if false;
+      }
+
+      // Sinais de Auditoria (Conflitos de Estoque, etc.)
+      match /signals/{signalId} {
+        allow read: if belongsToTenant(tenantId);
+        allow create: if belongsToTenant(tenantId);
+        allow update, delete: if isTenantAdmin(tenantId);
+      }
+
+      // Resumos Diários e Diagnósticos da IA: Leitura liberada para o tenant, gravação exclusiva de Admin ou Backend
       match /daily_summaries/{summaryId} {
         allow read: if belongsToTenant(tenantId);
-        // Escrita restrita a Cloud Functions (Service Account) ou Admin do Tenant
-        allow write: if belongsToTenant(tenantId);
+        allow write: if isTenantAdmin(tenantId);
       }
 
       // Contas a Pagar
       match /accounts_payable/{billId} {
-        allow read, write: if belongsToTenant(tenantId);
+        allow read: if belongsToTenant(tenantId);
+        allow write: if isTenantAdmin(tenantId);
       }
     }
   }

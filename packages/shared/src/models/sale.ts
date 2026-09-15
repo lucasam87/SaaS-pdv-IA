@@ -43,4 +43,5 @@ export interface Sale {
   status: SaleStatus;
   createdAt: number;
   syncedAt?: number; // Data em que a venda local subiu para o Firebase
+  operationId?: string; // Identificador único da operação para idempotência na nuvem
 }

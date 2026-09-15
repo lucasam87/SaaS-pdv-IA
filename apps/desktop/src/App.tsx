@@ -12,6 +12,8 @@ import { SaleWriterService } from './services/sale-writer';
 import { Product, Sale, SaleItem, SalePayment, CashSession, TenantSettings } from '@pdv/shared';
 import { CheckCircle } from 'lucide-react';
 
+import { syncWorkerClient } from './services/sync-worker-client';
+
 const DEMO_TENANT_ID = 'tenant_demo_001';
 const DEFAULT_SETTINGS: TenantSettings = {
   receiptHeader: 'MERCEARIA CENTRAL\nRUA DAS FLORES, 123 - CENTRO',
@@ -53,14 +55,41 @@ export const App: React.FC = () => {
   const [isCashModalOpen, setIsCashModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Sincronização & Rede
-  const [isOnline] = useState(true);
+  // Sincronização & Rede Reativa
+  const [isOnline, setIsOnline] = useState(() =>
+    typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true
+  );
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
 
-  // Inicialização e Carga de Produtos Demo
+  // Inicialização, carga e escuta de eventos de rede
   useEffect(() => {
     localDb.seedDemoProductsIfEmpty(DEMO_TENANT_ID);
-    setPendingSyncCount(localDb.getPendingSales().length);
+    setPendingSyncCount(localDb.getPendingOutboxCount());
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      syncWorkerClient.syncOnce().then(() => {
+        setPendingSyncCount(localDb.getPendingOutboxCount());
+      });
+    };
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    // Inicia o worker em background com intervalo regular
+    syncWorkerClient.start();
+
+    const interval = setInterval(() => {
+      setPendingSyncCount(localDb.getPendingOutboxCount());
+    }, 3000);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      syncWorkerClient.stop();
+      clearInterval(interval);
+    };
   }, []);
 
   // Atalhos Globais de Teclado
@@ -173,8 +202,10 @@ export const App: React.FC = () => {
   // Conclusão e Impressão da Venda
   const handleConfirmPayment = async (payments: SalePayment[], customerName?: string) => {
     const saleNumber = Math.floor(Math.random() * 9000) + 1000;
+    const saleId = `sale_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const newSale: Sale = {
-      id: `sale_${Date.now()}`,
+      id: saleId,
+      operationId: `op_${saleId}`,
       tenantId: DEMO_TENANT_ID,
       sessionId: currentSession?.id || 'session_001',
       saleNumber,
@@ -193,8 +224,11 @@ export const App: React.FC = () => {
     };
 
     // 1. Processa a venda aplicando estratégia Online-First com Fallback local
-    const writeResult = await SaleWriterService.processSale(newSale, isOnline);
-    setPendingSyncCount(localDb.getPendingSales().length);
+    const writeResult = await SaleWriterService.processSale(newSale, isOnline, async (saleToSave) => {
+      // Simulação de transação de nuvem (quando online)
+      return { success: true, saleId: saleToSave.id };
+    });
+    setPendingSyncCount(localDb.getPendingOutboxCount());
 
     // 2. Dispara a impressão na impressora térmica USB
     await ThermalPrinterService.printSaleReceipt(writeResult.sale, {
@@ -231,7 +265,7 @@ export const App: React.FC = () => {
 
   // Gestão de Caixa (Abertura, Fechamento, Sangria)
   const handleOpenSession = (initialAmount: number) => {
-    setCurrentSession({
+    const session: CashSession = {
       id: `session_${Date.now()}`,
       tenantId: DEMO_TENANT_ID,
       terminalNumber: deviceConfig.terminalNumber,
@@ -247,14 +281,19 @@ export const App: React.FC = () => {
       totalSangrias: 0,
       totalSuprimentos: 0,
       status: 'OPEN',
-    });
+    };
+
+    localDb.openCashSession(session);
+    setCurrentSession(session);
     showToast(`Caixa aberto no [${deviceConfig.deviceName}]! Troco: R$ ${initialAmount.toFixed(2)}`);
   };
 
   const handleCloseSession = (finalReported: number, notes?: string) => {
     if (!currentSession) return;
-    const expected = currentSession.initialAmount + currentSession.totalCashSales - currentSession.totalSangrias + currentSession.totalSuprimentos;
+    const expected = currentSession.initialAmount + currentSession.totalCashSales + currentSession.totalSuprimentos - currentSession.totalSangrias;
     const difference = finalReported - expected;
+
+    localDb.closeCashSession(currentSession.id, finalReported, expected, difference, notes);
 
     setCurrentSession((prev) => {
       if (!prev) return null;
@@ -279,6 +318,20 @@ export const App: React.FC = () => {
   };
 
   const handleSangria = (amount: number, reason: string) => {
+    if (currentSession) {
+      localDb.recordCashMovement({
+        id: `mov_san_${Date.now()}`,
+        tenantId: DEMO_TENANT_ID,
+        sessionId: currentSession.id,
+        type: 'SANGRIA',
+        amount,
+        reason,
+        userId: 'user_01',
+        userName: 'Lucas (Operador)',
+        createdAt: Date.now(),
+      });
+    }
+
     setCurrentSession((prev) => {
       if (!prev) return null;
       return {
@@ -290,6 +343,20 @@ export const App: React.FC = () => {
   };
 
   const handleSuprimento = (amount: number, reason: string) => {
+    if (currentSession) {
+      localDb.recordCashMovement({
+        id: `mov_sup_${Date.now()}`,
+        tenantId: DEMO_TENANT_ID,
+        sessionId: currentSession.id,
+        type: 'SUPRIMENTO',
+        amount,
+        reason,
+        userId: 'user_01',
+        userName: 'Lucas (Operador)',
+        createdAt: Date.now(),
+      });
+    }
+
     setCurrentSession((prev) => {
       if (!prev) return null;
       return {
@@ -311,9 +378,11 @@ export const App: React.FC = () => {
         currentSession={currentSession}
         isOnline={isOnline}
         pendingSyncCount={pendingSyncCount}
-        onSyncNow={() => {
-          showToast('Sincronização com o Firebase concluída!');
-          setPendingSyncCount(0);
+        onSyncNow={async () => {
+          showToast('Iniciando sincronização com a nuvem...');
+          const res = await syncWorkerClient.syncOnce();
+          setPendingSyncCount(localDb.getPendingOutboxCount());
+          showToast(`Sincronização concluída: ${res.successCount} sincronizado(s).`);
         }}
         onOpenCashModal={() => setIsCashModalOpen(true)}
       />

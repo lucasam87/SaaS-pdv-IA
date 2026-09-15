@@ -14,10 +14,11 @@ export class SaleWriterService {
   /**
    * Finaliza e grava a venda aplicando a estratégia Online-First com Fallback de Contingência.
    *
-   * 1. Se estiver online: tenta efetuar a transação na nuvem com timeout de 2.5s.
-   * 2. Se a nuvem responder: atualiza o cache local e marca como sincronizada.
-   * 3. Se a internet falhar/timeout/offline: grava imediatamente no SQLite/cache local
-   *    e joga na fila de contingência para envio posterior. O balcão NUNCA trava.
+   * 1. Gera deterministicamente id e operationId antes de qualquer tentativa.
+   * 2. Se estiver online: tenta efetuar a transação na nuvem com timeout de 2.5s.
+   * 3. Se a nuvem responder: grava localmente com status sincronizado.
+   * 4. Se a internet falhar/timeout/offline: grava imediatamente no SQLite local
+   *    e mantém na outbox com o mesmo operationId. O balcão NUNCA trava.
    */
   public static async processSale(
     sale: Sale,
@@ -25,26 +26,41 @@ export class SaleWriterService {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     cloudTransactionFn?: (sale: Sale) => Promise<any>
   ): Promise<SaleWriteResult> {
-    // 1. Se o operador está em modo explicitamente offline
+    // Garante identificadores únicos e determinísticos antes de qualquer envio
+    const saleId = sale.id || `sale_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const operationId = sale.operationId || `op_${saleId}`;
+
+    const normalizedSale: Sale = {
+      ...sale,
+      id: saleId,
+      operationId,
+    };
+
+    // 1. Se o operador está em modo explicitamente offline ou sem função de nuvem
     if (!isOnline || !cloudTransactionFn) {
-      return this.recordLocallyAsFallback(sale, 'Operando em modo offline');
+      return this.recordLocallyAsFallback(normalizedSale, 'Operando em modo offline');
     }
 
-    // 2. Tenta transação online com timeout agressivo de 2500ms
+    // 2. Tenta transação online com timeout controlado
     try {
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('TIMEOUT_EXCEEDED')), 2500)
-      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error('TIMEOUT_EXCEEDED'));
+        }, 2500);
+        // Desassocia o timer caso a runtime suporte unref
+        if (typeof (timer as any)?.unref === 'function') {
+          (timer as any).unref();
+        }
+      });
 
-      await Promise.race([cloudTransactionFn(sale), timeoutPromise]);
+      await Promise.race([cloudTransactionFn(normalizedSale), timeoutPromise]);
 
-      // Transação na nuvem foi concluída com sucesso!
-      const onlineSale: Sale = { ...sale, syncedAt: Date.now() };
+      // Transação na nuvem foi concluída com sucesso dentro do prazo!
+      const onlineSale: Sale = { ...normalizedSale, syncedAt: Date.now() };
 
-      // Atualiza também o estoque no cache local do computador
+      // Grava no SQLite local como sincronizada
       localDb.recordLocalSale(onlineSale);
-      // Como já subiu para a nuvem na mesma transação, remove da fila pendente
-      localDb.markSalesAsSynced([onlineSale.id]);
+      localDb.markOutboxSuccess(onlineSale.id);
 
       return {
         success: true,
@@ -55,14 +71,14 @@ export class SaleWriterService {
     } catch (err) {
       console.warn('[SaleWriter] Falha ou lentidão na nuvem, acionando contingência offline:', err);
       return this.recordLocallyAsFallback(
-        sale,
-        'Internet lenta ou indisponível — salva em contingência local'
+        normalizedSale,
+        'Internet lenta ou indisponível — salva em contingência local com fila de outbox'
       );
     }
   }
 
   private static recordLocallyAsFallback(sale: Sale, reason: string): SaleWriteResult {
-    // 1. Grava no banco local instantaneamente (< 1ms) e deduz o estoque local provisoriamente
+    // Grava no SQLite local atomicamente (< 1ms) e deduz o estoque local provisoriamente
     localDb.recordLocalSale(sale);
 
     return {
