@@ -3,34 +3,68 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // Função auxiliar para verificar se o usuário está autenticado
+    // -------------------------------------------------------------------------
+    // Funções Auxiliares de Autenticação e Autorização Multi-Tenant
+    // -------------------------------------------------------------------------
     function isAuthenticated() {
       return request.auth != null;
     }
 
-    // Função para verificar se o usuário pertence a este tenant
+    // Obtém o tenantId do token ou fallback para uid (dono da conta)
+    function getTenantId() {
+      return request.auth.token.tenantId != null ? request.auth.token.tenantId : request.auth.uid;
+    }
+
+    // Verifica se o usuário autenticado pertence ao tenant solicitado
     function belongsToTenant(tenantId) {
-      return isAuthenticated() && 
-        (request.auth.token.tenantId == tenantId || 
-         request.auth.uid == tenantId);
+      return isAuthenticated() && getTenantId() == tenantId;
+    }
+
+    // Obtém o papel (role) do usuário
+    function getUserRole() {
+      return request.auth.token.role != null ? request.auth.token.role : 'CASHIER';
     }
 
     // Verifica papel de administrador ou gerente
     function isTenantAdmin(tenantId) {
       return belongsToTenant(tenantId) &&
-        (request.auth.token.role == 'ADMIN' || 
-         request.auth.token.role == 'MANAGER' ||
-         request.auth.uid == tenantId);
+        (getUserRole() == 'ADMIN' || 
+         getUserRole() == 'MANAGER' ||
+         (request.auth.token.tenantId == null && request.auth.uid == tenantId));
     }
 
-    // Regras Multi-Tenant: Todo recurso reside sob tenants/{tenantId}
-    match /tenants/{tenantId} {
-      // Dono do tenant ou membro autorizado pode ler o perfil da loja
-      allow read: if belongsToTenant(tenantId);
-      // Alterações de cadastro da empresa restritas a Administradores
-      allow write: if isTenantAdmin(tenantId);
+    // Verifica papel operacional (caixa, gerente ou admin)
+    function isCashierOrAdmin(tenantId) {
+      return belongsToTenant(tenantId) &&
+        (getUserRole() == 'ADMIN' || 
+         getUserRole() == 'MANAGER' || 
+         getUserRole() == 'CASHIER' ||
+         (request.auth.token.tenantId == null && request.auth.uid == tenantId));
+    }
 
-      // Segredos e Chaves de API (Telegram / IA): BLOQUEADO para clientes.
+    // Detecta se há segredos confidenciais nos dados que não devem vazar para o documento público
+    function hasSecrets(data) {
+      return ('geminiApiKey' in data) ||
+             ('telegramBotToken' in data) ||
+             ('secrets' in data) ||
+             ('settings' in data && (
+               ('geminiApiKey' in data.settings) ||
+               ('telegramBotToken' in data.settings)
+             ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Estrutura Multi-Tenant sob /tenants/{tenantId}
+    // -------------------------------------------------------------------------
+    match /tenants/{tenantId} {
+      // Membros autorizados podem ler o perfil básico da loja
+      allow read: if belongsToTenant(tenantId);
+      
+      // Alterações de cadastro da empresa restritas a Administradores.
+      // Proibido salvar segredos (chaves de API) no documento público do tenant!
+      allow write: if isTenantAdmin(tenantId) && !hasSecrets(request.resource.data);
+
+      // Segredos e Chaves de API (Telegram / IA): BLOQUEIO TOTAL para clientes.
       // Acessível unicamente pelo Firebase Admin SDK (Cloud Functions / Backend).
       match /private_config/{document=**} {
         allow read, write: if false;
@@ -45,7 +79,6 @@ service cloud.firestore {
       // Catálogo de Produtos e Lotes
       match /products/{productId} {
         allow read: if belongsToTenant(tenantId);
-        // Operadores de caixa e admin podem ler; gravação restrita a admin/gerente
         allow write: if isTenantAdmin(tenantId);
       }
 
@@ -54,48 +87,119 @@ service cloud.firestore {
         allow write: if isTenantAdmin(tenantId);
       }
 
-      // Sessões de Caixa e Movimentações
+      // -----------------------------------------------------------------------
+      // Sessões de Caixa (Controle de Abertura, Fechamento e Totais)
+      // -----------------------------------------------------------------------
       match /cash_sessions/{sessionId} {
         allow read: if belongsToTenant(tenantId);
-        // Operadores e gerentes podem abrir e fechar sessões
-        allow create, update: if belongsToTenant(tenantId);
+
+        // Abertura de caixa:
+        // - Operador ou Admin autorizado do tenant
+        // - O responsável na abertura deve ser o usuário autenticado
+        // - Status inicial obrigatório: 'OPEN'
+        // - Valores numéricos válidos e sem dados de fechamento prematuros
+        allow create: if isCashierOrAdmin(tenantId) &&
+          request.resource.data.tenantId == tenantId &&
+          request.resource.data.status == 'OPEN' &&
+          request.resource.data.openedByUserId == request.auth.uid &&
+          request.resource.data.initialAmount is number &&
+          request.resource.data.initialAmount >= 0 &&
+          request.resource.data.terminalNumber is int &&
+          request.resource.data.terminalNumber > 0 &&
+          !('closedAt' in request.resource.data) &&
+          !('closedByUserId' in request.resource.data);
+
+        // Fechamento ou atualização de sessão:
+        // - A sessão no banco DEVE estar com status 'OPEN' (não pode alterar sessão já fechada)
+        // - Apenas o próprio operador que abriu ou um Admin/Gerente pode fechar
+        // - Campos imutáveis de abertura não podem ser alterados
+        // - Transição de status permitida: 'OPEN' -> 'CLOSED' (ou manter 'OPEN' com totais atualizados)
+        // - Se fechar ('CLOSED'): closedAt e closedByUserId obrigatórios
+        allow update: if belongsToTenant(tenantId) &&
+          resource.data.status == 'OPEN' &&
+          (resource.data.openedByUserId == request.auth.uid || isTenantAdmin(tenantId)) &&
+          request.resource.data.tenantId == resource.data.tenantId &&
+          request.resource.data.openedByUserId == resource.data.openedByUserId &&
+          request.resource.data.openedAt == resource.data.openedAt &&
+          request.resource.data.initialAmount == resource.data.initialAmount &&
+          request.resource.data.terminalNumber == resource.data.terminalNumber &&
+          (
+            // Mantém aberta atualizando totais
+            (request.resource.data.status == 'OPEN') ||
+            // Ou fecha a sessão
+            (request.resource.data.status == 'CLOSED' &&
+             request.resource.data.closedAt is number &&
+             (request.resource.data.closedByUserId == request.auth.uid || isTenantAdmin(tenantId)) &&
+             request.resource.data.finalReportedAmount is number)
+          );
+
         allow delete: if false;
       }
 
+      // -----------------------------------------------------------------------
+      // Movimentações de Caixa (Sangrias e Suprimentos)
+      // -----------------------------------------------------------------------
       match /cash_movements/{movementId} {
         allow read: if belongsToTenant(tenantId);
-        allow create: if belongsToTenant(tenantId);
+
+        // Criação de movimentação:
+        // - Usuário autenticado vinculado ao tenant
+        // - O responsável da movimentação DEVE ser o próprio usuário autenticado
+        // - Tipo estrito: 'SANGRIA' ou 'SUPRIMENTO'
+        // - Valor deve ser numérico e estritamente positivo
+        allow create: if isCashierOrAdmin(tenantId) &&
+          request.resource.data.tenantId == tenantId &&
+          request.resource.data.userId == request.auth.uid &&
+          (request.resource.data.type == 'SANGRIA' || request.resource.data.type == 'SUPRIMENTO') &&
+          request.resource.data.amount is number &&
+          request.resource.data.amount > 0 &&
+          request.resource.data.sessionId is string;
+
+        // Movimentações financeiras são estritamente imutáveis para auditoria
         allow update, delete: if false;
       }
 
-      // Vendas: Imutáveis após registro. Clientes não podem deletar nem alterar vendas passadas.
+      // -----------------------------------------------------------------------
+      // Vendas: EXCLUSIVO do backend transacional (Cloud Functions / Admin SDK)
+      // -----------------------------------------------------------------------
+      // Clientes não podem criar vendas diretamente no Firestore. Toda venda deve
+      // passar pelo endpoint transacional para garantia de integridade, dedução
+      // atômica de estoque, idempotência e geração do comprovante de auditoria.
       match /sales/{saleId} {
         allow read: if belongsToTenant(tenantId);
-        allow create: if belongsToTenant(tenantId);
-        allow update, delete: if false;
+        allow write: if false;
       }
 
-      // Barreira de Idempotência de Operações
+      // -----------------------------------------------------------------------
+      // Barreira de Idempotência e Comprovantes em Operations
+      // -----------------------------------------------------------------------
+      // Gravação EXCLUSIVA do backend (Firebase Admin SDK).
+      // Clientes podem apenas ler comprovantes para conferir confirmações.
       match /operations/{operationId} {
         allow read: if belongsToTenant(tenantId);
-        allow create: if belongsToTenant(tenantId);
-        allow update, delete: if false;
+        allow write: if false;
       }
 
+      // -----------------------------------------------------------------------
       // Sinais de Auditoria (Conflitos de Estoque, etc.)
+      // -----------------------------------------------------------------------
       match /signals/{signalId} {
         allow read: if belongsToTenant(tenantId);
         allow create: if belongsToTenant(tenantId);
         allow update, delete: if isTenantAdmin(tenantId);
       }
 
-      // Resumos Diários e Diagnósticos da IA: Leitura liberada para o tenant, gravação exclusiva de Admin ou Backend
+      // -----------------------------------------------------------------------
+      // Resumos Diários e Diagnósticos da IA
+      // -----------------------------------------------------------------------
       match /daily_summaries/{summaryId} {
         allow read: if belongsToTenant(tenantId);
         allow write: if isTenantAdmin(tenantId);
       }
 
+      // -----------------------------------------------------------------------
       // Contas a Pagar
+      // -----------------------------------------------------------------------
       match /accounts_payable/{billId} {
         allow read: if belongsToTenant(tenantId);
         allow write: if isTenantAdmin(tenantId);

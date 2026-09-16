@@ -1,6 +1,6 @@
-import { Product, Sale, CashSession, CashMovement } from '@pdv/shared';
+import { Product, ProductUnit, Sale, CashSession, CashMovement } from '@pdv/shared';
 import { ISqliteDriver, createSqliteDriver } from './sqlite-driver';
-import { runMigrations, runMigrationsSync } from './schema';
+import { runMigrations } from './schema';
 
 export interface LocalSyncMeta {
   lastSyncAt: number;
@@ -8,15 +8,19 @@ export interface LocalSyncMeta {
   pendingSalesCount: number;
 }
 
+export type OutboxStatus = 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'REVIEW_REQUIRED';
+
 export interface OutboxRecord {
   id: string;
   tenantId: string;
   type: string;
   operationId: string;
   payload: string;
-  status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED';
+  status: OutboxStatus;
   attempts: number;
   lastError?: string;
+  nextAttemptAt: number;
+  processingDeadline: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -24,66 +28,74 @@ export interface OutboxRecord {
 export class LocalDatabase {
   private driver: ISqliteDriver;
   private initialized: boolean = false;
-  // Cache em memória para busca instantânea de produtos (< 1ms)
+  private initPromise: Promise<void> | null = null;
+
+  // Cache em memória para busca instantânea de produtos (< 1ms para leitor de código de barras)
   private productsByBarcode: Map<string, Product> = new Map();
   private productsById: Map<string, Product> = new Map();
   private productsList: Product[] = [];
 
   constructor(driver?: ISqliteDriver) {
     this.driver = driver || createSqliteDriver();
-    this.ensureInitializedSync();
   }
 
-  private ensureInitializedSync() {
-    if (this.initialized) return;
-    try {
-      runMigrationsSync(this.driver);
-      this.loadProductsIntoCache();
-      this.initialized = true;
-    } catch (err) {
-      console.error('[LocalDB] Falha ao inicializar banco local SQLite sincronamente:', err);
-      // Fallback para async se o driver for assíncrono (ex: Tauri)
-      runMigrations(this.driver).then(() => {
-        this.loadProductsIntoCache();
+  /**
+   * Centraliza a inicialização do banco de dados em uma única Promise memoizada.
+   * Aguarda migrations DDL e carga completa do cache antes de resolver.
+   */
+  public initialize(): Promise<void> {
+    if (this.initialized) {
+      return Promise.resolve();
+    }
+    if (!this.initPromise) {
+      this.initPromise = (async () => {
+        await runMigrations(this.driver);
+        await this.loadProductsIntoCache();
         this.initialized = true;
-      }).catch((e) => console.error('[LocalDB] Erro no fallback assíncrono:', e));
+      })().catch((err) => {
+        this.initPromise = null;
+        throw err;
+      });
+    }
+    return this.initPromise;
+  }
+
+  public isReady(): boolean {
+    return this.initialized;
+  }
+
+  public async ensureReady(): Promise<void> {
+    if (!this.initialized) {
+      await this.initialize();
     }
   }
 
-  public async initialize(): Promise<void> {
-    if (this.initialized) return;
-    await runMigrations(this.driver);
-    await this.loadProductsIntoCache();
-    this.initialized = true;
-  }
-
-  private loadProductsIntoCache() {
+  public async loadProductsIntoCache(): Promise<void> {
     try {
-      const rows = this.driver.query<any>(
+      const rows = await this.driver.query<Record<string, unknown>>(
         'SELECT * FROM local_products WHERE is_active = 1;'
       );
-      if (Array.isArray(rows)) {
-        this.populateCacheFromRows(rows);
-      }
+      this.populateCacheFromRows(rows);
     } catch (err) {
       console.error('[LocalDB] Erro ao carregar produtos para cache:', err);
+      throw err;
     }
   }
 
-  private populateCacheFromRows(rows: any[]) {
+  private populateCacheFromRows(rows: Record<string, unknown>[]) {
     this.productsByBarcode.clear();
     this.productsById.clear();
     this.productsList = rows.map((r) => ({
-      id: r.id,
-      tenantId: r.tenant_id,
-      name: r.name,
-      barcode: r.barcode,
+      id: String(r.id),
+      tenantId: String(r.tenant_id),
+      name: String(r.name),
+      barcode: String(r.barcode),
       costPrice: Number(r.cost_price),
       sellingPrice: Number(r.selling_price),
       minStock: Number(r.min_stock),
       currentStock: Number(r.current_stock),
-      unit: r.unit || 'UN',
-      category: r.category || 'Geral',
+      unit: (r.unit as ProductUnit) || 'UN',
+      category: (r.category as string) || 'Geral',
       isActive: Boolean(r.is_active),
       createdAt: Number(r.updated_at),
       updatedAt: Number(r.updated_at),
@@ -96,6 +108,8 @@ export class LocalDatabase {
       }
     }
   }
+
+  // --- Buscas Síncronas Instantâneas no Cache (< 1ms) ---
 
   public findByBarcode(barcode: string): Product | undefined {
     return this.productsByBarcode.get(barcode.trim());
@@ -119,13 +133,17 @@ export class LocalDatabase {
     return results;
   }
 
+  // --- Operações Assíncronas de Persistência no SQLite ---
+
   /**
-   * Atualiza produtos no SQLite e no cache em memória.
+   * Atualiza produtos no SQLite e atualiza o cache em memória atomicamente.
    */
-  public upsertDeltaProducts(incomingProducts: Product[], syncTimestamp: number) {
-    this.driver.transaction(() => {
+  public async upsertDeltaProducts(incomingProducts: Product[], syncTimestamp: number): Promise<void> {
+    await this.ensureReady();
+
+    await this.driver.transaction(async (tx) => {
       for (const p of incomingProducts) {
-        this.driver.execute(
+        await tx.execute(
           `INSERT INTO local_products (
             id, tenant_id, name, barcode, cost_price, selling_price,
             min_stock, current_stock, unit, category, is_active, updated_at
@@ -158,18 +176,18 @@ export class LocalDatabase {
         );
       }
 
-      this.driver.execute(
+      await tx.execute(
         `INSERT INTO sync_metadata (key, value, updated_at) VALUES ('lastSyncAt', ?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;`,
         [String(syncTimestamp), syncTimestamp]
       );
     });
 
-    this.loadProductsIntoCache();
+    await this.loadProductsIntoCache();
   }
 
   /**
-   * Gravação de Venda Atômica com Idempotência e Propagação de Erro.
+   * Gravação de Venda Atômica com Idempotência e Propagação Estrita de Erro.
    *
    * Transação única engloba:
    * 1. Verificação de idempotência (sale.id).
@@ -179,22 +197,39 @@ export class LocalDatabase {
    * 5. Baixa de estoque em local_products e log em local_stock_movements.
    * 6. Insert em outbox_operations.
    *
-   * Se qualquer etapa falhar, ocorre ROLLBACK e a exceção é propagada ao chamador.
+   * Se qualquer etapa falhar, ocorre ROLLBACK completo e o erro é propagado.
    */
-  public recordLocalSale(sale: Sale): void {
-    this.driver.transaction(() => {
-      // 1. Guarda de Idempotência: se a venda já foi gravada, não duplica estoque nem outbox!
-      const existing = this.driver.query<{ id: string }>(
-        'SELECT id FROM local_sales WHERE id = ?;',
+  public async recordLocalSale(sale: Sale): Promise<void> {
+    await this.ensureReady();
+
+    await this.driver.transaction(async (tx) => {
+      // 1. Guarda de Idempotência e Detecção de Conteúdo Comercial Divergente
+      const existing = await tx.query<{ id: string; total: number; subtotal: number }>(
+        'SELECT id, total, subtotal FROM local_sales WHERE id = ?;',
         [sale.id]
       );
-      if (Array.isArray(existing) && existing.length > 0) {
-        console.warn(`[LocalDB] Venda "${sale.id}" já gravada anteriormente. Ignorando re-gravação idempotente.`);
+      if (existing.length > 0) {
+        const row = existing[0];
+        const existingTotal = Number(row.total);
+        const existingSubtotal = Number(row.subtotal);
+        const tolerance = 0.001;
+
+        const isDivergent =
+          Math.abs(existingTotal - sale.total) > tolerance ||
+          Math.abs(existingSubtotal - sale.subtotal) > tolerance;
+
+        if (isDivergent) {
+          throw new Error(
+            `[LocalDB] Conflito de integridade comercial: Venda "${sale.id}" já foi gravada com valores divergentes (Gravado: R$ ${existingTotal.toFixed(2)}, Recebido: R$ ${sale.total.toFixed(2)}). Operação abortada para evitar corrupção.`
+          );
+        }
+
+        console.warn(`[LocalDB] Venda "${sale.id}" já gravada anteriormente com conteúdo idêntico. Ignorando re-gravação idempotente.`);
         return;
       }
 
       // 2. Insert da Venda
-      this.driver.execute(
+      await tx.execute(
         `INSERT INTO local_sales (
           id, tenant_id, session_id, device_id, sale_number, user_id, user_name,
           customer_name, subtotal, discount, total, total_cost, status, created_at, synced_at
@@ -218,11 +253,11 @@ export class LocalDatabase {
         ]
       );
 
-      // 3. Insert dos Itens
+      // 3. Insert dos Itens e Baixa de Estoque
       for (let i = 0; i < sale.items.length; i++) {
         const item = sale.items[i];
         const itemId = `${sale.id}_item_${i + 1}`;
-        this.driver.execute(
+        await tx.execute(
           `INSERT INTO local_sale_items (
             id, sale_id, product_id, product_name, barcode, quantity,
             unit_price, unit_cost, discount, total_price, total_cost, lot_id
@@ -243,21 +278,21 @@ export class LocalDatabase {
           ]
         );
 
-        // 4. Baixa de estoque e movimentação
-        const prodRows = this.driver.query<{ current_stock: number }>(
+        // Baixa de estoque e movimentação
+        const prodRows = await tx.query<{ current_stock: number }>(
           'SELECT current_stock FROM local_products WHERE id = ?;',
           [item.productId]
         );
         const prevStock = prodRows.length > 0 ? Number(prodRows[0].current_stock) : 0;
         const newStock = prevStock - item.quantity;
 
-        this.driver.execute(
+        await tx.execute(
           'UPDATE local_products SET current_stock = current_stock - ? WHERE id = ?;',
           [item.quantity, item.productId]
         );
 
         const movementId = `mov_${sale.id}_${item.productId}_${i + 1}`;
-        this.driver.execute(
+        await tx.execute(
           `INSERT INTO local_stock_movements (
             id, tenant_id, product_id, device_id, sale_id, quantity,
             previous_stock, new_stock, type, created_at
@@ -276,11 +311,11 @@ export class LocalDatabase {
         );
       }
 
-      // 5. Insert dos Pagamentos
+      // 4. Insert dos Pagamentos
       for (let i = 0; i < sale.payments.length; i++) {
         const payment = sale.payments[i];
         const paymentId = `${sale.id}_pay_${i + 1}`;
-        this.driver.execute(
+        await tx.execute(
           `INSERT INTO local_sale_payments (
             id, sale_id, method, amount, change_amount
           ) VALUES (?, ?, ?, ?, ?);`,
@@ -294,17 +329,18 @@ export class LocalDatabase {
         );
       }
 
-      // 6. Enfileira na Outbox de Sincronização
+      // 5. Enfileira na Outbox de Sincronização
+      const operationId = sale.operationId || sale.id;
       const outboxId = `outbox_${sale.id}`;
       const outboxStatus = sale.syncedAt ? 'SYNCED' : 'PENDING';
-      this.driver.execute(
+      await tx.execute(
         `INSERT INTO outbox_operations (
-          id, tenant_id, type, operation_id, payload, status, attempts, created_at, updated_at
-        ) VALUES (?, ?, 'SALE_CREATED', ?, ?, ?, 0, ?, ?);`,
+          id, tenant_id, type, operation_id, payload, status, attempts, next_attempt_at, processing_deadline, created_at, updated_at
+        ) VALUES (?, ?, 'SALE_CREATED', ?, ?, ?, 0, 0, 0, ?, ?);`,
         [
           outboxId,
           sale.tenantId,
-          sale.id,
+          operationId,
           JSON.stringify(sale),
           outboxStatus,
           sale.createdAt,
@@ -314,11 +350,12 @@ export class LocalDatabase {
     });
 
     // Atualiza cache em memória após sucesso da transação
-    this.loadProductsIntoCache();
+    await this.loadProductsIntoCache();
   }
 
-  public getPendingSales(): Sale[] {
-    const rows = this.driver.query<{ payload: string }>(
+  public async getPendingSales(): Promise<Sale[]> {
+    await this.ensureReady();
+    const rows = await this.driver.query<{ payload: string }>(
       `SELECT payload FROM outbox_operations 
        WHERE status = 'PENDING' AND type = 'SALE_CREATED' 
        ORDER BY created_at ASC;`
@@ -326,88 +363,339 @@ export class LocalDatabase {
     return rows.map((r) => JSON.parse(r.payload) as Sale);
   }
 
-  public getPendingOutboxCount(): number {
-    const rows = this.driver.query<{ count: number }>(
-      "SELECT COUNT(*) as count FROM outbox_operations WHERE status IN ('PENDING', 'FAILED');"
+  public async getPendingOutboxCount(): Promise<number> {
+    await this.ensureReady();
+    // Contabiliza rigorosamente TODAS as operações ainda não confirmadas na nuvem
+    const rows = await this.driver.query<{ count: number }>(
+      "SELECT COUNT(*) as count FROM outbox_operations WHERE status != 'SYNCED';"
     );
     return rows.length > 0 ? Number(rows[0].count) : 0;
   }
 
-  public getPendingOutboxOperations(limit: number = 50): OutboxRecord[] {
-    const rows = this.driver.query<any>(
+  public async getOutboxStats(): Promise<{
+    pending: number;
+    processing: number;
+    failed: number;
+    reviewRequired: number;
+    synced: number;
+    totalUnconfirmed: number;
+    total: number;
+  }> {
+    await this.ensureReady();
+    const rows = await this.driver.query<{ status: string; count: number }>(
+      'SELECT status, COUNT(*) as count FROM outbox_operations GROUP BY status;'
+    );
+    const stats = {
+      pending: 0,
+      processing: 0,
+      failed: 0,
+      reviewRequired: 0,
+      synced: 0,
+      totalUnconfirmed: 0,
+      total: 0,
+    };
+    for (const r of rows) {
+      const count = Number(r.count);
+      stats.total += count;
+      if (r.status === 'PENDING') stats.pending = count;
+      else if (r.status === 'PROCESSING') stats.processing = count;
+      else if (r.status === 'FAILED') stats.failed = count;
+      else if (r.status === 'REVIEW_REQUIRED') stats.reviewRequired = count;
+      else if (r.status === 'SYNCED') stats.synced = count;
+    }
+    stats.totalUnconfirmed = stats.pending + stats.processing + stats.failed + stats.reviewRequired;
+    return stats;
+  }
+
+  public async getPendingOutboxOperations(limit: number = 50): Promise<OutboxRecord[]> {
+    await this.ensureReady();
+    const rows = await this.driver.query<Record<string, unknown>>(
       `SELECT * FROM outbox_operations 
        WHERE status IN ('PENDING', 'FAILED') 
        ORDER BY created_at ASC LIMIT ?;`,
       [limit]
     );
     return rows.map((r) => ({
-      id: r.id,
-      tenantId: r.tenant_id,
-      type: r.type,
-      operationId: r.operation_id,
-      payload: r.payload,
-      status: r.status,
+      id: String(r.id),
+      tenantId: String(r.tenant_id),
+      type: String(r.type),
+      operationId: String(r.operation_id),
+      payload: String(r.payload),
+      status: r.status as OutboxStatus,
       attempts: Number(r.attempts),
-      lastError: r.last_error || undefined,
+      lastError: r.last_error ? String(r.last_error) : undefined,
+      nextAttemptAt: Number(r.next_attempt_at || 0),
+      processingDeadline: Number(r.processing_deadline || 0),
       createdAt: Number(r.created_at),
       updatedAt: Number(r.updated_at),
     }));
   }
 
-  public markOutboxProcessing(operationId: string) {
-    this.driver.execute(
-      "UPDATE outbox_operations SET status = 'PROCESSING', updated_at = ? WHERE operation_id = ?;",
-      [Date.now(), operationId]
+  /**
+   * Recupera operações abandonadas em PROCESSING após expiração do prazo de concessão (processing_deadline).
+   * Operações com tentativas esgotadas são enviadas para REVIEW_REQUIRED; as demais voltam para PENDING.
+   */
+  public async recoverAbandonedProcessing(
+    now: number = Date.now(),
+    maxAttempts: number = 10
+  ): Promise<number> {
+    await this.ensureReady();
+    return await this.driver.transaction(async (tx) => {
+      // 1. Abandonadas com tentativas esgotadas -> REVIEW_REQUIRED
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'REVIEW_REQUIRED', processing_deadline = 0, updated_at = ? 
+         WHERE status = 'PROCESSING' AND processing_deadline > 0 AND processing_deadline <= ? AND attempts >= ?;`,
+        [now, now, maxAttempts]
+      );
+
+      // 2. Abandonadas com tentativas restantes -> PENDING
+      const countRows = await tx.query<{ count: number }>(
+        `SELECT COUNT(*) as count FROM outbox_operations 
+         WHERE status = 'PROCESSING' AND processing_deadline > 0 AND processing_deadline <= ?;`,
+        [now]
+      );
+      const recoveredCount = countRows.length > 0 ? Number(countRows[0].count) : 0;
+
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'PENDING', processing_deadline = 0, updated_at = ? 
+         WHERE status = 'PROCESSING' AND processing_deadline > 0 AND processing_deadline <= ?;`,
+        [now, now]
+      );
+
+      return recoveredCount;
+    });
+  }
+
+  /**
+   * Reivindica atomicamente um lote de operações elegíveis para processamento.
+   * 1. Recupera operações abandonadas em PROCESSING com prazo vencido.
+   * 2. Filtra no SQL apenas operações elegíveis (evitando que tentativas esgotadas ocupem o limite do lote).
+   * 3. Atualiza atomicamente os registros para status PROCESSING com prazo limite de execução (processing_deadline).
+   */
+  public async claimEligibleOutboxBatch(
+    limit: number = 20,
+    processingLeaseMs: number = 60000,
+    forceImmediate: boolean = false,
+    maxAttempts: number = 10
+  ): Promise<OutboxRecord[]> {
+    await this.ensureReady();
+    const now = Date.now();
+    const deadline = now + processingLeaseMs;
+
+    return await this.driver.transaction(async (tx) => {
+      // 1. Recupera operações abandonadas
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'REVIEW_REQUIRED', processing_deadline = 0, updated_at = ? 
+         WHERE status = 'PROCESSING' AND processing_deadline > 0 AND processing_deadline <= ? AND attempts >= ?;`,
+        [now, now, maxAttempts]
+      );
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'PENDING', processing_deadline = 0, updated_at = ? 
+         WHERE status = 'PROCESSING' AND processing_deadline > 0 AND processing_deadline <= ?;`,
+        [now, now]
+      );
+
+      // 2. Seleciona estritamente registros elegíveis no SQL antes do LIMIT
+      let querySql: string;
+      let queryParams: any[];
+
+      if (forceImmediate) {
+        // Modo forçado (ex: clique manual): antecipa retentativas sem aguardar next_attempt_at,
+        // mas respeita o limite de tentativas máximas (maxAttempts)
+        querySql = `
+          SELECT * FROM outbox_operations 
+          WHERE (status = 'PENDING') 
+             OR (status = 'FAILED' AND attempts < ?)
+          ORDER BY created_at ASC 
+          LIMIT ?;
+        `;
+        queryParams = [maxAttempts, limit];
+      } else {
+        // Modo normal: respeita o next_attempt_at do backoff exponencial
+        querySql = `
+          SELECT * FROM outbox_operations 
+          WHERE (status = 'PENDING' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) 
+             OR (status = 'FAILED' AND attempts < ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+          ORDER BY created_at ASC 
+          LIMIT ?;
+        `;
+        queryParams = [now, maxAttempts, now, limit];
+      }
+
+      const rows = await tx.query<Record<string, unknown>>(querySql, queryParams);
+      if (rows.length === 0) {
+        return [];
+      }
+
+      // 3. Reivindica atomicamente o lote
+      const claimed: OutboxRecord[] = [];
+      for (const r of rows) {
+        const id = String(r.id);
+        const currentAttempts = Number(r.attempts || 0);
+        const newAttempts = currentAttempts + 1;
+
+        await tx.execute(
+          `UPDATE outbox_operations 
+           SET status = 'PROCESSING', processing_deadline = ?, attempts = ?, updated_at = ? 
+           WHERE id = ?;`,
+          [deadline, newAttempts, now, id]
+        );
+
+        claimed.push({
+          id,
+          tenantId: String(r.tenant_id),
+          type: String(r.type),
+          operationId: String(r.operation_id),
+          payload: String(r.payload),
+          status: 'PROCESSING',
+          attempts: newAttempts,
+          lastError: r.last_error ? String(r.last_error) : undefined,
+          nextAttemptAt: Number(r.next_attempt_at || 0),
+          processingDeadline: deadline,
+          createdAt: Number(r.created_at),
+          updatedAt: now,
+        });
+      }
+
+      return claimed;
+    });
+  }
+
+  public async markOutboxProcessing(operationId: string, leaseMs: number = 60000): Promise<void> {
+    await this.ensureReady();
+    const now = Date.now();
+    await this.driver.execute(
+      `UPDATE outbox_operations 
+       SET status = 'PROCESSING', processing_deadline = ?, updated_at = ? 
+       WHERE operation_id = ? OR operation_id = ('op_' || ?) OR id = ('outbox_' || ?);`,
+      [now + leaseMs, now, operationId, operationId, operationId]
     );
   }
 
-  public markOutboxSuccess(operationId: string) {
+  public async markOutboxSuccess(operationId: string): Promise<void> {
+    await this.ensureReady();
     const now = Date.now();
-    this.driver.transaction(() => {
-      this.driver.execute(
-        "UPDATE outbox_operations SET status = 'SYNCED', updated_at = ? WHERE operation_id = ?;",
-        [now, operationId]
+    await this.driver.transaction(async (tx) => {
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'SYNCED', processing_deadline = 0, updated_at = ? 
+         WHERE operation_id = ? OR operation_id = ('op_' || ?) OR id = ('outbox_' || ?);`,
+        [now, operationId, operationId, operationId]
       );
-      this.driver.execute(
-        'UPDATE local_sales SET synced_at = ? WHERE id = ?;',
-        [now, operationId]
+      await tx.execute(
+        `UPDATE local_sales SET synced_at = ? 
+         WHERE id = ? OR ('op_' || id) = ?;`,
+        [now, operationId, operationId]
       );
     });
   }
 
-  public markOutboxFailed(operationId: string, errorMessage: string) {
-    this.driver.execute(
-      `UPDATE outbox_operations 
-       SET status = 'FAILED', attempts = attempts + 1, last_error = ?, updated_at = ? 
-       WHERE operation_id = ?;`,
-      [errorMessage, Date.now(), operationId]
-    );
+  public async markOutboxFailed(
+    operationId: string,
+    errorMessage: string,
+    baseDelayMs: number = 1500,
+    maxDelayMs: number = 30000,
+    maxAttempts: number = 10
+  ): Promise<{ status: OutboxStatus; nextAttemptAt?: number }> {
+    await this.ensureReady();
+    const now = Date.now();
+
+    return await this.driver.transaction(async (tx) => {
+      const rows = await tx.query<{ attempts: number }>(
+        `SELECT attempts FROM outbox_operations 
+         WHERE operation_id = ? OR operation_id = ('op_' || ?) OR id = ('outbox_' || ?);`,
+        [operationId, operationId, operationId]
+      );
+      const attempts = rows.length > 0 ? Number(rows[0].attempts) : 1;
+
+      if (attempts >= maxAttempts) {
+        // Esgotou tentativas: entra em estado de revisão operacional
+        await tx.execute(
+          `UPDATE outbox_operations 
+           SET status = 'REVIEW_REQUIRED', last_error = ?, processing_deadline = 0, updated_at = ? 
+           WHERE operation_id = ? OR operation_id = ('op_' || ?) OR id = ('outbox_' || ?);`,
+          [errorMessage, now, operationId, operationId, operationId]
+        );
+        return { status: 'REVIEW_REQUIRED' };
+      }
+
+      // Calcula backoff exponencial com jitter
+      const backoff = Math.min(baseDelayMs * Math.pow(2, attempts - 1), maxDelayMs);
+      const jitter = Math.floor(Math.random() * 500);
+      const nextAttemptAt = now + backoff + jitter;
+
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'FAILED', next_attempt_at = ?, last_error = ?, processing_deadline = 0, updated_at = ? 
+         WHERE operation_id = ? OR operation_id = ('op_' || ?) OR id = ('outbox_' || ?);`,
+        [nextAttemptAt, errorMessage, now, operationId, operationId, operationId]
+      );
+
+      return { status: 'FAILED', nextAttemptAt };
+    });
   }
 
-  public markSalesAsSynced(syncedSaleIds: string[]) {
+  public async reprocessOutboxOperation(operationId: string): Promise<boolean> {
+    await this.ensureReady();
+    const now = Date.now();
+    await this.driver.execute(
+      `UPDATE outbox_operations 
+       SET status = 'PENDING', attempts = 0, next_attempt_at = 0, processing_deadline = 0, last_error = NULL, updated_at = ? 
+       WHERE operation_id = ? OR operation_id = ('op_' || ?) OR id = ('outbox_' || ?);`,
+      [now, operationId, operationId, operationId]
+    );
+    return true;
+  }
+
+  public async reprocessAllReviewRequired(): Promise<number> {
+    await this.ensureReady();
+    const now = Date.now();
+    return await this.driver.transaction(async (tx) => {
+      const rows = await tx.query<{ count: number }>(
+        "SELECT COUNT(*) as count FROM outbox_operations WHERE status = 'REVIEW_REQUIRED';"
+      );
+      const count = rows.length > 0 ? Number(rows[0].count) : 0;
+      await tx.execute(
+        `UPDATE outbox_operations 
+         SET status = 'PENDING', attempts = 0, next_attempt_at = 0, processing_deadline = 0, last_error = NULL, updated_at = ? 
+         WHERE status = 'REVIEW_REQUIRED';`,
+        [now]
+      );
+      return count;
+    });
+  }
+
+  public async markSalesAsSynced(syncedSaleIds: string[]): Promise<void> {
     for (const id of syncedSaleIds) {
-      this.markOutboxSuccess(id);
+      await this.markOutboxSuccess(id);
     }
   }
 
-  public getMeta(): LocalSyncMeta {
-    const metaRows = this.driver.query<{ value: string }>(
+  public async getMeta(): Promise<LocalSyncMeta> {
+    await this.ensureReady();
+    const metaRows = await this.driver.query<{ value: string }>(
       "SELECT value FROM sync_metadata WHERE key = 'lastSyncAt';"
     );
     const lastSyncAt = metaRows.length > 0 ? Number(metaRows[0].value) : 0;
+    const pendingSalesCount = await this.getPendingOutboxCount();
     return {
       lastSyncAt,
       totalLocalProducts: this.productsList.length,
-      pendingSalesCount: this.getPendingOutboxCount(),
+      pendingSalesCount,
     };
   }
 
-  public seedDemoProductsIfEmpty(tenantId: string) {
-    const countRows = this.driver.query<{ count: number }>(
+  public async seedDemoProductsIfEmpty(tenantId: string): Promise<void> {
+    await this.ensureReady();
+    const countRows = await this.driver.query<{ count: number }>(
       'SELECT COUNT(*) as count FROM local_products;'
     );
     if (countRows.length > 0 && Number(countRows[0].count) > 0) {
-      this.loadProductsIntoCache();
+      await this.loadProductsIntoCache();
       return;
     }
 
@@ -504,11 +792,12 @@ export class LocalDatabase {
       },
     ];
 
-    this.upsertDeltaProducts(demoItems, Date.now());
+    await this.upsertDeltaProducts(demoItems, Date.now());
   }
 
-  public recordCashMovement(movement: CashMovement) {
-    this.driver.execute(
+  public async recordCashMovement(movement: CashMovement): Promise<void> {
+    await this.ensureReady();
+    await this.driver.execute(
       `INSERT INTO local_cash_movements (
         id, tenant_id, session_id, type, amount, reason, user_id, user_name, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`,
@@ -526,8 +815,9 @@ export class LocalDatabase {
     );
   }
 
-  public openCashSession(session: CashSession) {
-    this.driver.execute(
+  public async openCashSession(session: CashSession): Promise<void> {
+    await this.ensureReady();
+    await this.driver.execute(
       `INSERT INTO local_cash_sessions (
         id, tenant_id, device_id, terminal_number, opened_by_user_id,
         opened_by_name, opened_at, initial_amount, total_cash_sales,
@@ -547,14 +837,15 @@ export class LocalDatabase {
     );
   }
 
-  public closeCashSession(
+  public async closeCashSession(
     sessionId: string,
     finalAmount: number,
     calculatedAmount: number,
     difference: number,
     notes?: string
-  ) {
-    this.driver.execute(
+  ): Promise<void> {
+    await this.ensureReady();
+    await this.driver.execute(
       `UPDATE local_cash_sessions SET
         status = 'CLOSED',
         closed_at = ?,
@@ -565,6 +856,10 @@ export class LocalDatabase {
        WHERE id = ?;`,
       [Date.now(), finalAmount, calculatedAmount, difference, notes || null, sessionId]
     );
+  }
+
+  public async close(): Promise<void> {
+    await this.driver.close();
   }
 }
 

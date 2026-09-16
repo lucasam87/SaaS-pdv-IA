@@ -55,21 +55,49 @@ export const App: React.FC = () => {
   const [isCashModalOpen, setIsCashModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  // Estado de prontidão do banco SQLite
+  const [isDbReady, setIsDbReady] = useState(false);
+
   // Sincronização & Rede Reativa
   const [isOnline, setIsOnline] = useState(() =>
     typeof navigator !== 'undefined' && typeof navigator.onLine === 'boolean' ? navigator.onLine : true
   );
+  const [outboxStats, setOutboxStats] = useState({ pending: 0, processing: 0, failed: 0, synced: 0, total: 0 });
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
+
+  const refreshSyncStats = async () => {
+    try {
+      const stats = await localDb.getOutboxStats();
+      setOutboxStats(stats);
+      setPendingSyncCount(stats.pending + stats.failed + stats.processing);
+    } catch (err) {
+      console.error('[App] Erro ao atualizar status da outbox:', err);
+    }
+  };
 
   // Inicialização, carga e escuta de eventos de rede
   useEffect(() => {
-    localDb.seedDemoProductsIfEmpty(DEMO_TENANT_ID);
-    setPendingSyncCount(localDb.getPendingOutboxCount());
+    let isMounted = true;
+
+    const initDb = async () => {
+      try {
+        await localDb.initialize();
+        await localDb.seedDemoProductsIfEmpty(DEMO_TENANT_ID);
+        if (isMounted) {
+          await refreshSyncStats();
+          setIsDbReady(true);
+        }
+      } catch (err) {
+        console.error('[App] Falha crítica na inicialização do SQLite local:', err);
+      }
+    };
+
+    initDb();
 
     const handleOnline = () => {
       setIsOnline(true);
       syncWorkerClient.syncOnce().then(() => {
-        setPendingSyncCount(localDb.getPendingOutboxCount());
+        refreshSyncStats();
       });
     };
     const handleOffline = () => setIsOnline(false);
@@ -81,10 +109,11 @@ export const App: React.FC = () => {
     syncWorkerClient.start();
 
     const interval = setInterval(() => {
-      setPendingSyncCount(localDb.getPendingOutboxCount());
+      refreshSyncStats();
     }, 3000);
 
     return () => {
+      isMounted = false;
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
       syncWorkerClient.stop();
@@ -205,7 +234,7 @@ export const App: React.FC = () => {
     const saleId = `sale_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const newSale: Sale = {
       id: saleId,
-      operationId: `op_${saleId}`,
+      operationId: saleId, // Padronização da Task 3: operation_id recebe sale.id
       tenantId: DEMO_TENANT_ID,
       sessionId: currentSession?.id || 'session_001',
       saleNumber,
@@ -223,48 +252,62 @@ export const App: React.FC = () => {
       createdAt: Date.now(),
     };
 
-    // 1. Processa a venda aplicando estratégia Online-First com Fallback local
-    const writeResult = await SaleWriterService.processSale(newSale, isOnline, async (saleToSave) => {
-      // Simulação de transação de nuvem (quando online)
-      return { success: true, saleId: saleToSave.id };
-    });
-    setPendingSyncCount(localDb.getPendingOutboxCount());
+    try {
+      // 1. Processa a venda com persistência local OBRIGATÓRIA antes de qualquer envio.
+      // Se a persistência no SQLite falhar, uma exceção é lançada e o fluxo é interrompido.
+      const writeResult = await SaleWriterService.processSale(newSale, isOnline, undefined);
+      await refreshSyncStats();
 
-    // 2. Dispara a impressão na impressora térmica USB
-    await ThermalPrinterService.printSaleReceipt(writeResult.sale, {
-      storeName: 'Mercearia Central',
-      storeCnpj: '12.345.678/0001-90',
-      settings: DEFAULT_SETTINGS,
-    });
+      // 2. Dispara a impressão na impressora térmica USB SOMENTE após sucesso comprovado da persistência
+      try {
+        await ThermalPrinterService.printSaleReceipt(writeResult.sale, {
+          storeName: 'Mercearia Central',
+          storeCnpj: '12.345.678/0001-90',
+          settings: DEFAULT_SETTINGS,
+        });
+      } catch (printErr) {
+        console.warn('[App] Venda persistida com sucesso, mas impressora térmica não respondeu:', printErr);
+        showToast('Aviso: Venda confirmada, mas ocorreu falha na comunicação com a impressora USB.');
+      }
 
-    // 3. Atualiza totais da sessão do caixa
-    if (currentSession) {
-      const isCash = payments.some((p) => p.method === 'DINHEIRO');
-      const isPix = payments.some((p) => p.method === 'PIX');
-      const isCard = payments.some((p) => p.method === 'DEBITO' || p.method === 'CREDITO');
-      const isCredit = payments.some((p) => p.method === 'FIADO');
+      // 3. Atualiza totais da sessão do caixa
+      if (currentSession) {
+        const isCash = payments.some((p) => p.method === 'DINHEIRO');
+        const isPix = payments.some((p) => p.method === 'PIX');
+        const isCard = payments.some((p) => p.method === 'DEBITO' || p.method === 'CREDITO');
+        const isCredit = payments.some((p) => p.method === 'FIADO');
 
-      setCurrentSession((prev) => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          totalCashSales: isCash ? prev.totalCashSales + total : prev.totalCashSales,
-          totalPixSales: isPix ? prev.totalPixSales + total : prev.totalPixSales,
-          totalCardSales: isCard ? prev.totalCardSales + total : prev.totalCardSales,
-          totalCreditSales: isCredit ? prev.totalCreditSales + total : prev.totalCreditSales,
-        };
-      });
+        setCurrentSession((prev) => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            totalCashSales: isCash ? prev.totalCashSales + total : prev.totalCashSales,
+            totalPixSales: isPix ? prev.totalPixSales + total : prev.totalPixSales,
+            totalCardSales: isCard ? prev.totalCardSales + total : prev.totalCardSales,
+            totalCreditSales: isCredit ? prev.totalCreditSales + total : prev.totalCreditSales,
+          };
+        });
+      }
+
+      // 4. Limpa e prepara o caixa para o próximo cliente
+      setIsPaymentModalOpen(false);
+      handleNewSale();
+      const modeBadge =
+        writeResult.mode === 'ONLINE_TRANSACTION'
+          ? '✅ Nuvem Confirmada'
+          : '⚡ Fila Local (Pendente Nuvem)';
+      showToast(`Venda #${saleNumber} concluída [${modeBadge}]!`);
+    } catch (persistErr: any) {
+      // Regra da Task 3: Impedir confirmação e impressão quando a persistência local falhar!
+      const errorMsg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+      console.error('[App] Falha crítica ao persistir venda no SQLite:', errorMsg);
+      showToast(`ERRO CRÍTICO: Falha ao gravar venda (${errorMsg}). Venda NÃO confirmada!`);
+      // O modal de pagamento permanece aberto e o carrinho permanece intacto para retentativa
     }
-
-    // 4. Limpa e prepara o caixa para o próximo cliente
-    setIsPaymentModalOpen(false);
-    handleNewSale();
-    const modeBadge = writeResult.mode === 'ONLINE_TRANSACTION' ? '✅ Nuvem' : '⚡ Fila Local';
-    showToast(`Venda #${saleNumber} concluída [${modeBadge}] e impressa!`);
   };
 
   // Gestão de Caixa (Abertura, Fechamento, Sangria)
-  const handleOpenSession = (initialAmount: number) => {
+  const handleOpenSession = async (initialAmount: number) => {
     const session: CashSession = {
       id: `session_${Date.now()}`,
       tenantId: DEMO_TENANT_ID,
@@ -283,17 +326,17 @@ export const App: React.FC = () => {
       status: 'OPEN',
     };
 
-    localDb.openCashSession(session);
+    await localDb.openCashSession(session);
     setCurrentSession(session);
     showToast(`Caixa aberto no [${deviceConfig.deviceName}]! Troco: R$ ${initialAmount.toFixed(2)}`);
   };
 
-  const handleCloseSession = (finalReported: number, notes?: string) => {
+  const handleCloseSession = async (finalReported: number, notes?: string) => {
     if (!currentSession) return;
     const expected = currentSession.initialAmount + currentSession.totalCashSales + currentSession.totalSuprimentos - currentSession.totalSangrias;
     const difference = finalReported - expected;
 
-    localDb.closeCashSession(currentSession.id, finalReported, expected, difference, notes);
+    await localDb.closeCashSession(currentSession.id, finalReported, expected, difference, notes);
 
     setCurrentSession((prev) => {
       if (!prev) return null;
@@ -317,9 +360,9 @@ export const App: React.FC = () => {
     showToast(diffMsg);
   };
 
-  const handleSangria = (amount: number, reason: string) => {
+  const handleSangria = async (amount: number, reason: string) => {
     if (currentSession) {
-      localDb.recordCashMovement({
+      await localDb.recordCashMovement({
         id: `mov_san_${Date.now()}`,
         tenantId: DEMO_TENANT_ID,
         sessionId: currentSession.id,
@@ -342,9 +385,9 @@ export const App: React.FC = () => {
     showToast(`Sangria de R$ ${amount.toFixed(2)} registrada (${reason}).`);
   };
 
-  const handleSuprimento = (amount: number, reason: string) => {
+  const handleSuprimento = async (amount: number, reason: string) => {
     if (currentSession) {
-      localDb.recordCashMovement({
+      await localDb.recordCashMovement({
         id: `mov_sup_${Date.now()}`,
         tenantId: DEMO_TENANT_ID,
         sessionId: currentSession.id,
@@ -367,6 +410,16 @@ export const App: React.FC = () => {
     showToast(`Suprimento de R$ ${amount.toFixed(2)} adicionado (${reason}).`);
   };
 
+  if (!isDbReady) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-slate-950 text-slate-100 select-none">
+        <div className="w-10 h-10 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin mb-4" />
+        <h2 className="text-base font-bold text-slate-200">Inicializando SQLite Local</h2>
+        <p className="text-xs text-slate-400 font-mono mt-1">Executando migrations e preparando cache em memória...</p>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen bg-slate-950 text-slate-100 select-none overflow-hidden">
       {/* Header Principal */}
@@ -377,12 +430,19 @@ export const App: React.FC = () => {
         currentUser={{ name: 'Lucas', role: 'Operador' }}
         currentSession={currentSession}
         isOnline={isOnline}
+        outboxStats={outboxStats}
         pendingSyncCount={pendingSyncCount}
         onSyncNow={async () => {
-          showToast('Iniciando sincronização com a nuvem...');
-          const res = await syncWorkerClient.syncOnce();
-          setPendingSyncCount(localDb.getPendingOutboxCount());
-          showToast(`Sincronização concluída: ${res.successCount} sincronizado(s).`);
+          showToast('Tentando sincronizar operações pendentes com o backend...');
+          const res = await syncWorkerClient.syncOnce(true);
+          refreshSyncStats();
+          if (res.successCount > 0) {
+            showToast(`${res.successCount} operação(ões) sincronizada(s) com sucesso na nuvem!`);
+          } else if (res.failedCount > 0) {
+            showToast(`Sincronização pendente: nenhum backend remoto ativo (${res.failedCount} pendência(s)).`);
+          } else {
+            showToast('Nenhuma operação pendente para sincronizar.');
+          }
         }}
         onOpenCashModal={() => setIsCashModalOpen(true)}
       />

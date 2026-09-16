@@ -149,34 +149,16 @@ export const MIGRATIONS: Migration[] = [
       );`,
     ],
   },
+  {
+    version: 2,
+    description: 'Add next_attempt_at, processing_deadline to outbox_operations and queue index',
+    sql: [
+      `ALTER TABLE outbox_operations ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0;`,
+      `ALTER TABLE outbox_operations ADD COLUMN processing_deadline INTEGER NOT NULL DEFAULT 0;`,
+      `CREATE INDEX IF NOT EXISTS idx_outbox_queue ON outbox_operations(status, next_attempt_at, created_at);`,
+    ],
+  },
 ];
-
-export function runMigrationsSync(driver: ISqliteDriver): void {
-  driver.execute(`CREATE TABLE IF NOT EXISTS _migrations (
-    version INTEGER PRIMARY KEY,
-    description TEXT NOT NULL,
-    applied_at INTEGER NOT NULL
-  );`);
-
-  const appliedRows = driver.query<{ version: number }>(
-    'SELECT version FROM _migrations ORDER BY version ASC;'
-  );
-  const appliedVersions = new Set(appliedRows.map((r) => r.version));
-
-  for (const migration of MIGRATIONS) {
-    if (!appliedVersions.has(migration.version)) {
-      driver.transaction(() => {
-        for (const statement of migration.sql) {
-          driver.execute(statement);
-        }
-        driver.execute(
-          'INSERT INTO _migrations (version, description, applied_at) VALUES (?, ?, ?);',
-          [migration.version, migration.description, Date.now()]
-        );
-      });
-    }
-  }
-}
 
 export async function runMigrations(driver: ISqliteDriver): Promise<void> {
   await driver.execute(`CREATE TABLE IF NOT EXISTS _migrations (
@@ -192,11 +174,11 @@ export async function runMigrations(driver: ISqliteDriver): Promise<void> {
 
   for (const migration of MIGRATIONS) {
     if (!appliedVersions.has(migration.version)) {
-      await driver.transaction(async () => {
+      await driver.transaction(async (tx) => {
         for (const statement of migration.sql) {
-          await driver.execute(statement);
+          await tx.execute(statement);
         }
-        await driver.execute(
+        await tx.execute(
           'INSERT INTO _migrations (version, description, applied_at) VALUES (?, ?, ?);',
           [migration.version, migration.description, Date.now()]
         );
@@ -204,3 +186,4 @@ export async function runMigrations(driver: ISqliteDriver): Promise<void> {
     }
   }
 }
+

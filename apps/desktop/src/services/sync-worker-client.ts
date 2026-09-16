@@ -1,5 +1,6 @@
 import { localDb, OutboxRecord } from '../db/local-db';
 import { Sale } from '@pdv/shared';
+import { CloudApiClient } from './cloud-api-client';
 
 export type SyncHandlerFn = (op: OutboxRecord, sale: Sale) => Promise<{ success: boolean; error?: string }>;
 
@@ -8,6 +9,9 @@ export interface SyncWorkerOptions {
   maxDelayMs?: number;
   maxAttempts?: number;
   intervalMs?: number;
+  batchSize?: number;
+  processingLeaseMs?: number;
+  requestTimeoutMs?: number;
 }
 
 export class SyncWorkerClient {
@@ -23,13 +27,25 @@ export class SyncWorkerClient {
       maxDelayMs: options?.maxDelayMs ?? 30000,
       maxAttempts: options?.maxAttempts ?? 10,
       intervalMs: options?.intervalMs ?? 5000,
+      batchSize: options?.batchSize ?? 20,
+      processingLeaseMs: options?.processingLeaseMs ?? 60000,
+      requestTimeoutMs: options?.requestTimeoutMs ?? 5000,
     };
 
-    // Handler padrão caso não seja injetado (pode ser sobrescrito)
-    this.syncHandler = syncHandler || (async (_op, _sale) => {
-      // Por padrão tenta simular/chamar nuvem
-      return { success: true };
-    });
+    // Handler padrão: utiliza CloudApiClient (mesmo endpoint e contrato do envio imediato)
+    this.syncHandler =
+      syncHandler ||
+      (async (_op, sale) => {
+        try {
+          const res = await CloudApiClient.processSaleTransaction(sale);
+          return { success: res.success };
+        } catch (err: any) {
+          return {
+            success: false,
+            error: err.message || String(err),
+          };
+        }
+      });
   }
 
   public setSyncHandler(handler: SyncHandlerFn) {
@@ -60,8 +76,9 @@ export class SyncWorkerClient {
   }
 
   /**
-   * Executa uma rodada de sincronização de todos os registros pendentes da outbox.
-   * @param force Se true, ignora o tempo de backoff (útil para clique manual ou testes).
+   * Executa uma rodada de sincronização com reivindicação atômica e proteção contra bloqueio de fila.
+   * @param force Se true, antecipa retentativas transitórias (útil para clique manual ou testes),
+   *              sem contornar validações, autenticação ou integridade.
    */
   public async syncOnce(force: boolean = false): Promise<{ processedCount: number; successCount: number; failedCount: number }> {
     if (this.isProcessing) {
@@ -73,45 +90,55 @@ export class SyncWorkerClient {
     let failedCount = 0;
 
     try {
-      const pendingOperations = localDb.getPendingOutboxOperations(20);
+      // 1. Reivindica atomicamente os registros elegíveis em transação SQLite.
+      // - Registros em PROCESSING abandonados (prazo vencido) são automaticamente recuperados.
+      // - Registros com tentativas esgotadas são ignorados pelo SQL, nunca bloqueando as operações seguintes.
+      const claimedOperations = await localDb.claimEligibleOutboxBatch(
+        this.options.batchSize,
+        this.options.processingLeaseMs,
+        force,
+        this.options.maxAttempts
+      );
 
-      for (const op of pendingOperations) {
-        // Se excedeu o número máximo de tentativas
-        if (op.attempts >= this.options.maxAttempts) {
-          continue;
-        }
-
-        // Se não for forçado, calcula e respeita o backoff exponencial com jitter
-        if (!force) {
-          const backoff = Math.min(
-            this.options.baseDelayMs * Math.pow(2, op.attempts),
-            this.options.maxDelayMs
-          );
-          const jitter = Math.floor(Math.random() * 500);
-          const requiredDelay = backoff + jitter;
-
-          if (op.status === 'FAILED' && Date.now() - op.updatedAt < requiredDelay) {
-            continue;
-          }
-        }
-
-        localDb.markOutboxProcessing(op.operationId);
-
+      for (const op of claimedOperations) {
         try {
           const sale: Sale = JSON.parse(op.payload);
-          const result = await this.syncHandler(op, sale);
 
-          if (result.success) {
-            localDb.markOutboxSuccess(op.operationId);
+          // 2. Aplica timeout individual ao envio para que chamadas travadas não paralisem o worker
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            const timer = setTimeout(() => {
+              reject(new Error(`SYNC_TIMEOUT: Envio da operação "${op.operationId}" excedeu ${this.options.requestTimeoutMs}ms.`));
+            }, this.options.requestTimeoutMs);
+            if (typeof (timer as any)?.unref === 'function') {
+              (timer as any).unref();
+            }
+          });
+
+          const result = await Promise.race([this.syncHandler(op, sale), timeoutPromise]);
+
+          if (result && result.success) {
+            await localDb.markOutboxSuccess(op.operationId);
             successCount++;
           } else {
-            const errorMsg = result.error || 'Erro desconhecido retornado pela nuvem';
-            localDb.markOutboxFailed(op.operationId, errorMsg);
+            const errorMsg = result?.error || 'Erro desconhecido retornado pela nuvem';
+            await localDb.markOutboxFailed(
+              op.operationId,
+              errorMsg,
+              this.options.baseDelayMs,
+              this.options.maxDelayMs,
+              this.options.maxAttempts
+            );
             failedCount++;
           }
         } catch (err: any) {
           const errorMsg = err instanceof Error ? err.message : String(err);
-          localDb.markOutboxFailed(op.operationId, errorMsg);
+          await localDb.markOutboxFailed(
+            op.operationId,
+            errorMsg,
+            this.options.baseDelayMs,
+            this.options.maxDelayMs,
+            this.options.maxAttempts
+          );
           failedCount++;
         }
       }
@@ -126,9 +153,31 @@ export class SyncWorkerClient {
     }
   }
 
-  public getPendingCount(): number {
-    return localDb.getPendingOutboxCount();
+  /**
+   * Força uma sincronização imediata (acionado pelo botão manual na interface).
+   */
+  public async forceSync(): Promise<{ processedCount: number; successCount: number; failedCount: number }> {
+    return await this.syncOnce(true);
+  }
+
+  /**
+   * Recupera manualmente operações em processamento abandonadas.
+   */
+  public async recoverAbandoned(): Promise<number> {
+    return await localDb.recoverAbandonedProcessing(Date.now(), this.options.maxAttempts);
+  }
+
+  /**
+   * Reprocessa todas as operações que atingiram o estado de revisão.
+   */
+  public async reprocessReviewItems(): Promise<number> {
+    return await localDb.reprocessAllReviewRequired();
+  }
+
+  public async getPendingCount(): Promise<number> {
+    return await localDb.getPendingOutboxCount();
   }
 }
 
 export const syncWorkerClient = new SyncWorkerClient();
+

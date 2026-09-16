@@ -20,16 +20,17 @@ export class CacheReconciler {
    */
   public async reconcile(): Promise<{ updatedCount: number; lastSyncAt: number }> {
     if (this.isReconciling) {
-      return { updatedCount: 0, lastSyncAt: localDb.getMeta().lastSyncAt };
+      const currentMeta = await localDb.getMeta();
+      return { updatedCount: 0, lastSyncAt: currentMeta.lastSyncAt };
     }
 
     this.isReconciling = true;
     try {
-      const meta = localDb.getMeta();
+      const meta = await localDb.getMeta();
       const result = await this.fetchFn(meta.lastSyncAt);
 
       if (result.products.length > 0) {
-        localDb.upsertDeltaProducts(result.products, result.timestamp);
+        await localDb.upsertDeltaProducts(result.products, result.timestamp);
       }
 
       return {
