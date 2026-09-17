@@ -1,0 +1,38 @@
+﻿name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+      - 'fix/**'
+
+jobs:
+  verify:
+    name: Build and Verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Desktop application
+        run: npm --workspace=@pdv/desktop run build
+
+      - name: Build Cloud Functions
+        run: npm --workspace=functions run build
+
+      - name: Run verification test suite
+        run: npx tsx test-verification.ts

@@ -91,14 +91,24 @@ service cloud.firestore {
       }
 
       // Catálogo de Produtos e Lotes
+      // Gravação EXCLUSIVA via Cloud Functions (Firebase Admin SDK / apiSyncCatalog).
+      // Clientes não podem escrever diretamente em /products para garantir validações cadastrais,
+      // reserva atômica de código de barras e preservação do estoque operacional.
       match /products/{productId} {
         allow read: if belongsToTenant(tenantId);
-        allow write: if isTenantAdmin(tenantId);
+        allow write: if false;
+      }
+
+      // Reserva de unicidade de códigos de barras por tenant
+      // Exclusivo para escrita via apiSyncCatalog (Admin SDK)
+      match /barcode_reservations/{barcode} {
+        allow read: if belongsToTenant(tenantId);
+        allow write: if false;
       }
 
       match /lots/{lotId} {
         allow read: if belongsToTenant(tenantId);
-        allow write: if isTenantAdmin(tenantId);
+        allow write: if false;
       }
 
       // -----------------------------------------------------------------------

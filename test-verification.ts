@@ -30,6 +30,8 @@ import {
   FirestoreCatalogTransactionContext,
   assertCatalogPermissions,
   computeCanonicalCatalogHash,
+  validateCatalogPayload,
+  VALID_PRODUCT_UNITS,
 } from './functions/src/endpoints/catalog-endpoint';
 import { AuthenticatedUserContext, verifyAuthToken } from './functions/src/endpoints/sale-endpoint';
 
@@ -2539,6 +2541,7 @@ async function runRigorousVerification() {
 
   const catProducts = new Map<string, any>();
   const catOperations = new Map<string, any>();
+  const catBarcodeReservations = new Map<string, { productId: string }>();
   const catTxContext: FirestoreCatalogTransactionContext = {
     async getOperation(tId, opId) {
       return catOperations.get(`${tId}_${opId}`) || null;
@@ -2557,6 +2560,15 @@ async function runRigorousVerification() {
     },
     async recordOperation(tId, opId, data) {
       catOperations.set(`${tId}_${opId}`, { ...data });
+    },
+    async getBarcodeReservation(tId, barcode) {
+      return catBarcodeReservations.get(`${tId}_${barcode}`) || null;
+    },
+    async saveBarcodeReservation(tId, barcode, productId) {
+      catBarcodeReservations.set(`${tId}_${barcode}`, { productId });
+    },
+    async deleteBarcodeReservation(tId, barcode) {
+      catBarcodeReservations.delete(`${tId}_${barcode}`);
     },
   };
 
@@ -2899,7 +2911,564 @@ async function runRigorousVerification() {
   assert.strictEqual(successLog.inviteId, 'invite_valid_123');
   console.log('  ✓ assignUserClaims exige e consome convite pendente e audita tentativas com sucesso.');
 
-  console.log('  ✓ Critérios de aceite da Task 6.6 plenamente comprovados com excelência.\n');
+  // -------------------------------------------------------------------------
+  // TASK 6.7: Hardening de Integridade de Catálogo, Convites e CI
+  // -------------------------------------------------------------------------
+  console.log('\n================================================================');
+  console.log('🧪 ETAPA 17: HARDENING DE INTEGRIDADE DE CATÁLOGO, CONVITES E AUDITORIA');
+  console.log('================================================================\n');
+
+  // 17.1 Proteção do Estoque Remoto contra UPSERT Atrasado
+  console.log('  [17.1] Testando proteção de estoque remoto: UPSERT cadastral não sobrescreve saldo existente...');
+  const stockProdId = 'prod_remote_stock_protect';
+  const initialRemoteStock = 80;
+  catProducts.set(`${tenantA}_${stockProdId}`, {
+    id: stockProdId,
+    tenantId: tenantA,
+    name: 'Produto Estoque Protegido',
+    barcode: '7898888777666',
+    costPrice: 15,
+    sellingPrice: 30,
+    minStock: 5,
+    currentStock: initialRemoteStock, // Saldo já movimentado para 80
+    unit: 'UN',
+    category: 'Bebidas',
+    isActive: true,
+    createdAt: Date.now() - 10000,
+    updatedAt: Date.now() - 10000,
+  });
+  catBarcodeReservations.set(`${tenantA}_7898888777666`, { productId: stockProdId });
+
+  // Chega um UPSERT cadastral atrasado informando currentStock 100
+  const delayedUpsertPayload = {
+    id: stockProdId,
+    tenantId: tenantA,
+    name: 'Produto Estoque Protegido Nome Atualizado',
+    barcode: '7898888777666',
+    costPrice: 18,
+    sellingPrice: 35,
+    minStock: 5,
+    currentStock: 100, // Saldo desatualizado no cliente
+    initialStock: 100,
+    unit: 'UN',
+    category: 'Bebidas',
+    isActive: true,
+  };
+
+  await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_UPSERT',
+    delayedUpsertPayload,
+    'op_delayed_upsert_stock_test',
+    catTxContext
+  );
+
+  const productAfterDelayedUpsert = catProducts.get(`${tenantA}_${stockProdId}`);
+  assert.strictEqual(
+    productAfterDelayedUpsert.currentStock,
+    80,
+    'CRÍTICO: O estoque remoto no Firestore DEVE permanecer 80 e não ser sobrescrito pelo UPSERT cadastral (100).'
+  );
+  assert.strictEqual(productAfterDelayedUpsert.name, 'Produto Estoque Protegido Nome Atualizado');
+  assert.strictEqual(productAfterDelayedUpsert.costPrice, 18);
+  assert.strictEqual(productAfterDelayedUpsert.sellingPrice, 35);
+  console.log('  ✓ Saldo de estoque remoto (80) preservado intacto contra UPSERT cadastral atrasado.');
+
+  // 17.2 Validação Estrita de Autorização de Catálogo (assertCatalogPermissions)
+  console.log('  [17.2] Testando autorização estrita de catálogo (ADMIN e MANAGER apenas)...');
+  assertCatalogPermissions({ uid: 'admin_user', tenantId: tenantA, role: 'ADMIN' }, tenantA);
+  assertCatalogPermissions({ uid: 'mgr_user', tenantId: tenantA, role: 'MANAGER' }, tenantA);
+
+  assert.throws(
+    () => assertCatalogPermissions({ uid: 'cashier_user', tenantId: tenantA, role: 'CASHIER' }, tenantA),
+    /PERMISSION_DENIED: Papel "CASHIER" não autorizado/,
+    'Deve rejeitar CASHIER'
+  );
+  assert.throws(
+    () => assertCatalogPermissions({ uid: 'no_role_user', tenantId: tenantA } as any, tenantA),
+    /PERMISSION_DENIED: Papel \(role\) do usuário não informado ou ausente/,
+    'Deve rejeitar usuário com papel ausente'
+  );
+  assert.throws(
+    () => assertCatalogPermissions({ uid: 'null_role_user', tenantId: tenantA, role: null as any }, tenantA),
+    /PERMISSION_DENIED: Papel \(role\) do usuário não informado ou ausente/,
+    'Deve rejeitar usuário com role null'
+  );
+  assert.throws(
+    () => assertCatalogPermissions({ uid: 'hacker_user', tenantId: tenantA, role: 'SUPERUSER' as any }, tenantA),
+    /PERMISSION_DENIED: Papel "SUPERUSER" não autorizado/,
+    'Deve rejeitar role desconhecida/não autorizada'
+  );
+  console.log('  ✓ Autorização de catálogo valida estritamente ADMIN e MANAGER, bloqueando caixas e papéis ausentes.');
+
+  // 17.3 Validação de Payload de Catálogo sem `any` no Servidor (validateCatalogPayload)
+  console.log('  [17.3] Testando validação estrita de payload de catálogo no servidor...');
+  // A. Barcode com caracteres de controle ASCII
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_UPSERT',
+        {
+          id: 'p_bad_barcode',
+          tenantId: tenantA,
+          name: 'Produto Barcode Inválido',
+          barcode: '789123\x00456',
+          costPrice: 10,
+          sellingPrice: 20,
+          minStock: 2,
+          unit: 'UN',
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "barcode" contém caracteres de controle ASCII/,
+    'Deve rejeitar código de barras com caracteres de controle'
+  );
+
+  // B. Preço de custo negativo ou não-numérico
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_UPSERT',
+        {
+          id: 'p_bad_cost',
+          tenantId: tenantA,
+          name: 'Produto Custo Negativo',
+          barcode: '7891234567891',
+          costPrice: -5,
+          sellingPrice: 20,
+          minStock: 2,
+          unit: 'UN',
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "costPrice" inválido/,
+    'Deve rejeitar costPrice negativo'
+  );
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_UPSERT',
+        {
+          id: 'p_str_cost',
+          tenantId: tenantA,
+          name: 'Produto Custo String',
+          barcode: '7891234567891',
+          costPrice: '10' as any,
+          sellingPrice: 20,
+          minStock: 2,
+          unit: 'UN',
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "costPrice" inválido/,
+    'Deve rejeitar costPrice como string'
+  );
+
+  // C. Preço de venda zero ou negativo
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_UPSERT',
+        {
+          id: 'p_bad_sell',
+          tenantId: tenantA,
+          name: 'Produto Venda Zero',
+          barcode: '7891234567892',
+          costPrice: 10,
+          sellingPrice: 0,
+          minStock: 2,
+          unit: 'UN',
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "sellingPrice" inválido/,
+    'Deve rejeitar sellingPrice <= 0'
+  );
+
+  // D. Unidade não permitida
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_UPSERT',
+        {
+          id: 'p_bad_unit',
+          tenantId: tenantA,
+          name: 'Produto Unidade Inválida',
+          barcode: '7891234567893',
+          costPrice: 10,
+          sellingPrice: 20,
+          minStock: 2,
+          unit: 'LITRO' as any,
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "unit" inválida/,
+    'Deve rejeitar unidade fora do conjunto permitido'
+  );
+
+  // E. NCM com formato inválido
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_UPSERT',
+        {
+          id: 'p_bad_ncm',
+          tenantId: tenantA,
+          name: 'Produto NCM Inválido',
+          barcode: '7891234567894',
+          costPrice: 10,
+          sellingPrice: 20,
+          minStock: 2,
+          unit: 'UN',
+          ncm: '1', // Menos de 2 dígitos
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "ncm" inválido/,
+    'Deve rejeitar NCM com menos de 2 dígitos'
+  );
+
+  // F. Toggle com isActive não-booleano
+  assert.throws(
+    () =>
+      validateCatalogPayload(
+        'CATALOG_PRODUCT_TOGGLE',
+        {
+          id: 'p_toggle_str',
+          tenantId: tenantA,
+          isActive: 'false' as any,
+        },
+        tenantA
+      ),
+    /INVALID_PAYLOAD: "isActive" deve ser estritamente booleano/,
+    'Deve rejeitar isActive do tipo string em toggle'
+  );
+
+  // G. Payload válido deve retornar dados tipados e saneados
+  const validUpsertRes = validateCatalogPayload(
+    'CATALOG_PRODUCT_UPSERT',
+    {
+      id: 'p_valid_payload',
+      tenantId: tenantA,
+      name: '  Produto Válido  ',
+      barcode: ' 7891234567895 ',
+      costPrice: 10.5,
+      sellingPrice: 21.0,
+      minStock: 5,
+      unit: 'KG',
+      ncm: ' 1234.56.78 ',
+      isActive: true,
+      initialStock: 15,
+    },
+    tenantA
+  );
+  assert.strictEqual(validUpsertRes.upsertData?.name, 'Produto Válido');
+  assert.strictEqual(validUpsertRes.upsertData?.barcode, '7891234567895');
+  assert.strictEqual(validUpsertRes.upsertData?.ncm, '12345678');
+  assert.strictEqual(validUpsertRes.upsertData?.unit, 'KG');
+  assert.strictEqual(validUpsertRes.upsertData?.initialStock, 15);
+  console.log('  ✓ Validação rigorosa de payload sem `any` protege integridade contra dados malformados.');
+
+  // 17.4 Unicidade de Código de Barras na Nuvem (barcode_reservations)
+  console.log('  [17.4] Testando unicidade de código de barras na nuvem com reservas atômicas...');
+  const sharedBarcodeCloud = `789_cloud_bar_${Date.now()}`;
+  const prodCloudA = {
+    id: 'prod_cloud_A',
+    tenantId: tenantA,
+    name: 'Produto Cloud A',
+    barcode: sharedBarcodeCloud,
+    costPrice: 10,
+    sellingPrice: 20,
+    minStock: 2,
+    unit: 'UN' as const,
+    isActive: true,
+  };
+
+  // Cadastra produto A com o barcode
+  await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_UPSERT',
+    prodCloudA,
+    'op_cloud_barcode_1',
+    catTxContext
+  );
+  assert.strictEqual(catBarcodeReservations.get(`${tenantA}_${sharedBarcodeCloud}`)?.productId, 'prod_cloud_A');
+
+  // Tenta cadastrar produto B com o mesmo barcode no mesmo tenant -> INTEGRITY_CONFLICT
+  const prodCloudB = {
+    id: 'prod_cloud_B',
+    tenantId: tenantA,
+    name: 'Produto Cloud B Conflitante',
+    barcode: sharedBarcodeCloud,
+    costPrice: 15,
+    sellingPrice: 30,
+    minStock: 2,
+    unit: 'UN' as const,
+    isActive: true,
+  };
+  await assert.rejects(
+    async () =>
+      executeCatalogTransactionLogic(
+        tenantA,
+        'CATALOG_PRODUCT_UPSERT',
+        prodCloudB,
+        'op_cloud_barcode_2',
+        catTxContext
+      ),
+    /INTEGRITY_CONFLICT: Código de barras ".*" já está reservado pelo produto "prod_cloud_A"/,
+    'Deve rejeitar cadastro concorrente com mesmo código de barras no tenant'
+  );
+
+  // Produto A altera seu código de barras para um novo código
+  const newBarcodeA = `789_cloud_bar_new_${Date.now()}`;
+  await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_UPSERT',
+    { ...prodCloudA, barcode: newBarcodeA },
+    'op_cloud_barcode_3',
+    catTxContext
+  );
+  // Barcode antigo deve ter sido liberado e novo reservado
+  assert.strictEqual(catBarcodeReservations.get(`${tenantA}_${sharedBarcodeCloud}`), undefined, 'Barcode antigo liberado');
+  assert.strictEqual(catBarcodeReservations.get(`${tenantA}_${newBarcodeA}`)?.productId, 'prod_cloud_A', 'Novo barcode reservado');
+
+  // Agora Produto B consegue cadastrar com o barcode liberado com sucesso
+  await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_UPSERT',
+    prodCloudB,
+    'op_cloud_barcode_4',
+    catTxContext
+  );
+  assert.strictEqual(catBarcodeReservations.get(`${tenantA}_${sharedBarcodeCloud}`)?.productId, 'prod_cloud_B');
+
+  // Outro tenant pode usar o mesmo barcode sem interferência (particionamento por tenant)
+  const tenantBCloud = 'tenant_isolated_002';
+  await executeCatalogTransactionLogic(
+    tenantBCloud,
+    'CATALOG_PRODUCT_UPSERT',
+    { ...prodCloudA, id: 'prod_tenant_b_1', tenantId: tenantBCloud, barcode: sharedBarcodeCloud },
+    'op_cloud_barcode_tenantB',
+    catTxContext
+  );
+  assert.strictEqual(catBarcodeReservations.get(`${tenantBCloud}_${sharedBarcodeCloud}`)?.productId, 'prod_tenant_b_1');
+  console.log('  ✓ Unicidade de código de barras na nuvem com liberação em update e isolamento por tenant validada.');
+
+  // 17.5 Resiliência de Convites e Claims (Transação, CLAIMS_PENDING e Retry Idempotente)
+  console.log('  [17.5] Testando resiliência de convites: transação, CLAIMS_PENDING e recuperação de inconsistência...');
+  const txInviteAuditStore: any[] = [];
+  const txInviteStore = new Map<string, any>();
+  const txUsersStore = new Map<string, any>();
+  let simulateAuthSdkCrash = false;
+
+  const txMockAuthUsers = new Map<string, any>([
+    ['invited_operator', { uid: 'invited_operator', email: 'op@store.com', customClaims: {} }],
+  ]);
+
+  const txMockDeps = {
+    auth: {
+      async getUser(uid: string) {
+        const u = txMockAuthUsers.get(uid);
+        if (!u) throw new Error('NOT_FOUND');
+        return u;
+      },
+      async setCustomUserClaims(uid: string, claims: Record<string, unknown>) {
+        if (simulateAuthSdkCrash) {
+          throw new Error('Auth SDK Timeout / Connection reset');
+        }
+        const u = txMockAuthUsers.get(uid);
+        if (u) u.customClaims = claims;
+      },
+      async revokeRefreshTokens(_uid: string) {},
+    },
+    firestore: {
+      doc(p: string) {
+        return {
+          async get() {
+            if (p.includes('/users/')) {
+              const uid = p.split('/users/')[1];
+              const data = txUsersStore.get(uid);
+              return { exists: !!data, data: () => data };
+            }
+            if (p.includes('/invites/')) {
+              const invId = p.split('/invites/')[1];
+              const data = txInviteStore.get(invId);
+              return { exists: !!data, data: () => data };
+            }
+            return { exists: false };
+          },
+          async set(data: any) {
+            if (p.includes('/users/')) {
+              const uid = p.split('/users/')[1];
+              txUsersStore.set(uid, { ...(txUsersStore.get(uid) || {}), ...data });
+            }
+            if (p.includes('/invites/')) {
+              const invId = p.split('/invites/')[1];
+              txInviteStore.set(invId, { ...(txInviteStore.get(invId) || {}), ...data });
+            }
+            if (p.includes('/audit_logs/')) {
+              txInviteAuditStore.push(data);
+            }
+          },
+        };
+      },
+      collection(_p: string) {
+        return {
+          doc() {
+            const id = `audit_${Date.now()}_${Math.random().toString(36).substring(2)}`;
+            return {
+              id,
+              async set(data: any) {
+                txInviteAuditStore.push({ id, ...data });
+              },
+            };
+          },
+        };
+      },
+      async runTransaction<T>(updateFn: (tx: any) => Promise<T>): Promise<T> {
+        const tx = {
+          async get(ref: any) {
+            return ref.get();
+          },
+          async set(ref: any, data: any, _opts?: any) {
+            return ref.set(data);
+          },
+          async update(ref: any, data: any) {
+            return ref.set(data);
+          },
+        };
+        return updateFn(tx);
+      },
+    },
+  };
+
+  // A. Convite expirado deve ser rejeitado
+  txInviteStore.set('invite_expired', {
+    id: 'invite_expired',
+    targetUid: 'invited_operator',
+    status: 'PENDING',
+    role: 'CASHIER',
+    expiresAt: Date.now() - 5000,
+  });
+  await assert.rejects(
+    async () =>
+      assignUserClaims(adminCaller, 'invited_operator', tenantA, 'CASHIER', 'invite_expired', txMockDeps as any),
+    /PERMISSION_DENIED: O convite "invite_expired" está expirado/,
+    'Deve rejeitar convite expirado'
+  );
+
+  // B. Role solicitada divergente do convite deve ser rejeitada
+  txInviteStore.set('invite_role_mismatch', {
+    id: 'invite_role_mismatch',
+    targetUid: 'invited_operator',
+    status: 'PENDING',
+    role: 'CASHIER',
+    expiresAt: Date.now() + 60000,
+  });
+  await assert.rejects(
+    async () =>
+      assignUserClaims(adminCaller, 'invited_operator', tenantA, 'ADMIN', 'invite_role_mismatch', txMockDeps as any),
+    /PERMISSION_DENIED: Papel solicitado "ADMIN" diverge do papel especificado no convite \("CASHIER"\)/,
+    'Deve rejeitar atribuição com papel divergente do convite'
+  );
+
+  // C. Destinatário divergente deve ser rejeitado
+  txInviteStore.set('invite_wrong_user', {
+    id: 'invite_wrong_user',
+    targetUid: 'another_user',
+    email: 'other@store.com',
+    status: 'PENDING',
+    role: 'CASHIER',
+    expiresAt: Date.now() + 60000,
+  });
+  await assert.rejects(
+    async () =>
+      assignUserClaims(adminCaller, 'invited_operator', tenantA, 'CASHIER', 'invite_wrong_user', txMockDeps as any),
+    /PERMISSION_DENIED: Convite destinado ao usuário "another_user", mas foi solicitado para "invited_operator"/,
+    'Deve rejeitar convite destinado a outro usuário'
+  );
+
+  // D. Simulação de crash do Auth SDK: Firestore registra CLAIMS_PENDING sem corromper convite
+  const validResilientInviteId = 'invite_resilient_123';
+  txInviteStore.set(validResilientInviteId, {
+    id: validResilientInviteId,
+    targetUid: 'invited_operator',
+    email: 'op@store.com',
+    status: 'PENDING',
+    role: 'CASHIER',
+    expiresAt: Date.now() + 60000,
+  });
+
+  simulateAuthSdkCrash = true;
+  await assert.rejects(
+    async () =>
+      assignUserClaims(adminCaller, 'invited_operator', tenantA, 'CASHIER', validResilientInviteId, txMockDeps as any),
+    /AUTH_CLAIMS_ERROR.*Estado retido como CLAIMS_PENDING/,
+    'Deve disparar erro de auth claims retendo CLAIMS_PENDING'
+  );
+
+  // Verifica que o convite foi aceito por este usuário e o usuário está CLAIMS_PENDING
+  const userDuringCrash = txUsersStore.get('invited_operator');
+  assert.strictEqual(userDuringCrash.status, 'CLAIMS_PENDING');
+  assert.strictEqual(userDuringCrash.inviteId, validResilientInviteId);
+  const inviteDuringCrash = txInviteStore.get(validResilientInviteId);
+  assert.strictEqual(inviteDuringCrash.status, 'ACCEPTED');
+  assert.strictEqual(inviteDuringCrash.consumedBy, 'invited_operator');
+
+  // E. Retry subsequente após recuperação do Auth SDK conclui com sucesso (idempotência)
+  simulateAuthSdkCrash = false;
+  const claimsRetryResult = await assignUserClaims(
+    adminCaller,
+    'invited_operator',
+    tenantA,
+    'CASHIER',
+    validResilientInviteId,
+    txMockDeps as any
+  );
+  assert.strictEqual(claimsRetryResult.success, true);
+  assert.strictEqual(txUsersStore.get('invited_operator')?.status, 'ACTIVE');
+  assert.strictEqual(txMockAuthUsers.get('invited_operator')?.customClaims?.role, 'CASHIER');
+  console.log('  ✓ Consumo transacional de convite com tolerância a falhas (CLAIMS_PENDING e retry) 100% comprovado.');
+
+  // 17.6 Trilha de Auditoria com Fail-Closed (Operações Críticas Falham se Auditoria Indisponível)
+  console.log('  [17.6] Testando trilha de auditoria com fail-closed em modificação de privilégios...');
+  const brokenAuditDeps = {
+    ...txMockDeps,
+    firestore: {
+      ...txMockDeps.firestore,
+      collection(_p: string) {
+        return {
+          doc() {
+            return {
+              async set() {
+                throw new Error('Disco cheio / Firestore indisponível para gravação de auditoria');
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+
+  txInviteStore.set('invite_fail_audit', {
+    id: 'invite_fail_audit',
+    targetUid: 'invited_operator',
+    status: 'ACCEPTED',
+    consumedBy: 'invited_operator',
+    role: 'CASHIER',
+  });
+  // Usuário já está CLAIMS_PENDING ou ACTIVE, tenta reatribuir claims com auditoria quebrada
+  txUsersStore.set('invited_operator', { id: 'invited_operator', tenantId: tenantA, role: 'CASHIER', status: 'ACTIVE' });
+
+  await assert.rejects(
+    async () =>
+      assignUserClaims(adminCaller, 'invited_operator', tenantA, 'CASHIER', undefined, brokenAuditDeps as any),
+    /AUDIT_FAILURE: Falha ao registrar log de auditoria de privilégios/,
+    'Deve disparar AUDIT_FAILURE (fail-closed) se auditoria não puder ser persistida'
+  );
+  console.log('  ✓ Auditoria com fail-closed bloqueia modificações de privilégios caso log não possa ser persistido.');
+
+  console.log('\n  ✓ Critérios de aceite da Task 6.7 plenamente comprovados com excelência total.\n');
 }
 
 runRigorousVerification().catch((err) => {

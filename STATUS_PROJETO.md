@@ -24,8 +24,8 @@ O **SaaS PDV IA** é um sistema de frente de caixa e retaguarda desenhado especi
 
 ---
 
-### 2. Endurecimento Arquitetural e Auditoria (Tasks 1 a 6.5 — Testes Automatizados)
-Foram executadas baterias de testes com **16 suítes automatizadas (`test-verification.ts`) 100% aprovadas**:
+### 2. Endurecimento Arquitetural e Auditoria (Tasks 1 a 6.7 — Testes Automatizados)
+Foram executadas baterias de testes com **17 suítes automatizadas (`test-verification.ts`) 100% aprovadas**:
 
 - [x] **Task 1 — Eliminação de Confirmações Falsas de Sincronização**:
   - Remoção de mocks que simulavam sincronização remota sem enviar dados.
@@ -70,6 +70,15 @@ Foram executadas baterias de testes com **16 suítes automatizadas (`test-verifi
   - **Unificação de Unicidade de Código de Barras**: Produtos inativos continuam reservando o código de barras no banco (`UNIQUE(tenant_id, barcode)`); query preventiva no `local-db.ts` atualizada sem filtro de `is_active = 1`, retornando `ValidationError` tipado.
   - **Endurecimento de Permissões (`assignUserClaims`)**: Exigência de convite pendente em `tenants/{tenantId}/invites` para novos usuários sem `tenantId`, consumo atômico do convite e trilha de auditoria completa em `tenants/{tenantId}/audit_logs` para sucessos e tentativas negadas.
   - **Pipeline de Integração Contínua (CI)**: Workflow do GitHub Actions (`.github/workflows/ci.yml`) executando builds e suíte de testes automatizados a cada push e PR.
+- [x] **Task 6.7 — Correção de Integridade do Catálogo, Convites e CI**:
+  - **Proteção Estrita de Estoque Remoto**: `CATALOG_PRODUCT_UPSERT` preserva o `currentStock` existente no Firestore, bloqueando sobrescrita por dados cadastrais desatualizados; proibição de spread irrestrito (`...payload`); comprovado com teste onde estoque remoto 80 não é sobrescrito por payload com 100.
+  - **Autorização Estrita de Catálogo (`assertCatalogPermissions`)**: Rejeição determinística para operadores `CASHIER`, valores ausentes, `null`, `undefined` e desconhecidos, aceitando unicamente `ADMIN` e `MANAGER`.
+  - **Endpoint de Catálogo Mandatório nas Security Rules**: No `firebase/firestore.rules`, bloqueio total de escrita direta por clientes em `/products` e `/barcode_reservations` (`allow write: if false;`), forçando toda gravação a passar pelo Firebase Admin SDK na Cloud Function.
+  - **Validação de Payload no Servidor sem `any`**: Função `validateCatalogPayload` higieniza e valida tipos, rejeita caracteres de controle ASCII no barcode, rejeita preços negativos ou não-numéricos, valida formato de NCM (2 a 8 dígitos), valida unidades (`VALID_PRODUCT_UNITS`) e exige booleano estrito para `isActive`.
+  - **Reserva Atômica de Código de Barras na Nuvem**: Subcoleção `/tenants/{tenantId}/barcode_reservations/{barcode}` atualizada em transação atômica, prevenindo duplicidade de códigos no mesmo tenant (incluindo produtos inativos) e liberando o código antigo em caso de edição.
+  - **Resiliência de Convites e Claims**: Consumo de convite executado via `firestore.runTransaction` com validações de prazo, destinatário e role; transição de estado seguro com `CLAIMS_PENDING` que tolera falhas de conexão com o Auth SDK e permite recuperação idempotente sem corrupção de convites.
+  - **Trilha de Auditoria com Fail-Closed**: Eliminação de qualquer bypass silencioso de auditoria; modificações de privilégios de segurança falham com `AUDIT_FAILURE` caso o log de auditoria não possa ser persistido.
+  - **CI Workflow Pronta**: Pipeline `.github/workflows/ci.yml` configurada para execução contínua da suíte e builds.
 
 ---
 
@@ -145,7 +154,7 @@ Foram executadas baterias de testes com **16 suítes automatizadas (`test-verifi
    npm ci
    ```
 
-2. **Rodar a suíte de testes de auditoria (16 testes):**
+2. **Rodar a suíte de testes de auditoria (17 etapas):**
    ```bash
    npx tsx test-verification.ts
    ```

@@ -29,6 +29,8 @@ Base: revisão do [commit ad2f3bb](https://github.com/lucasam87/SaaS-pdv-IA/comm
 - [x] Task 5 — Recuperar e desbloquear a fila
 - [x] Task 6 — Corrigir regras de segurança
 - [x] Task 6.5 — Estabilização do módulo de produtos e correções pendentes da auditoria
+- [x] Task 6.6 — Fechamento técnico da estabilização
+- [x] Task 6.7 — Correção de integridade do catálogo, convites e CI
 - [ ] Task 7 — Reconstruir caixa por dados persistidos
 - [ ] Task 8 — Reconciliar estoque e isolar dados locais
 - [ ] Task 9 — Separar venda e impressão
@@ -225,6 +227,38 @@ Base: revisão do [commit ad2f3bb](https://github.com/lucasam87/SaaS-pdv-IA/comm
 | Evidências | Testes automatizados executados comprovando catálogo na nuvem, contrato de resposta, durabilidade pós-commit, unicidade de barcode com inativos, convites de tenant e trilha de auditoria. |
 | Limitações | Não configurado Docker e Task 7 não iniciada (conforme restrição do escopo). |
 | Próximo passo | Task 7 — Reconstruir caixa por dados persistidos. |
+
+## Task 6.6 — Fechamento técnico da estabilização
+
+**Arquivos alterados:** `functions/src/endpoints/catalog-endpoint.ts`, `apps/desktop/src/services/cloud-api-client.ts`, `apps/desktop/src/db/sqlite-driver.ts`, `apps/desktop/src/db/local-db.ts`, `functions/src/endpoints/auth-claims-endpoint.ts`, `.github/workflows/ci.yml`.
+
+### Ações
+
+- [x] Implementar backend real de sincronização de catálogo (`apiSyncCatalog`) com Firebase ID Token, autorização `ADMIN`/`MANAGER`, idempotência por `operationId`, hash SHA-256 e transação atômica.
+- [x] Endurecer contrato de respostas remotas no `CloudApiClient` exigindo `saleId` e `operationId` correspondentes.
+- [x] Corrigir persistência do `BrowserSqliteDriver`: nunca executar rollback de banco após `COMMIT;` confirmado; registrar estado `COMMITTED_BUT_NOT_PERSISTED` em falha de storage com suporte a `retryPersistence()`.
+- [x] Unificar regra de unicidade de barcode incluindo produtos inativos (`UNIQUE(tenant_id, barcode)`).
+- [x] Proteger atribuição de permissões (`assignUserClaims`) com consumo de convites pendentes e auditoria em `tenants/{tenantId}/audit_logs`.
+- [x] Configurar CI no GitHub Actions (`.github/workflows/ci.yml`).
+
+**Aceite:** backend de catálogo funcional e idempotente, contratos remotos sem aceitar respostas sem ID, isolamento de commit no SQLite e convites auditados.
+
+## Task 6.7 — Correção de integridade do catálogo, convites e CI
+
+**Arquivos alterados:** `functions/src/endpoints/catalog-endpoint.ts`, `firebase/firestore.rules`, `functions/src/endpoints/auth-claims-endpoint.ts`, `test-verification.ts`.
+
+### Ações
+
+- [x] **Proteger o estoque remoto**: `CATALOG_PRODUCT_UPSERT` preserva o `currentStock` existente no Firestore; proibido spread irrestrito de payload; criação inicial usa `initialStock` sem sobrescrever saldo existente; teste comprovando que saldo 80 permanece 80 mesmo com upsert atrasado informando 100.
+- [x] **Autorização estrita de catálogo**: `assertCatalogPermissions` rejeita explicitamente `CASHIER`, papéis ausentes, `null`, `undefined` e desconhecidos, aceitando exclusivamente `ADMIN` e `MANAGER`.
+- [x] **Tornar endpoint do catálogo obrigatório**: `firebase/firestore.rules` atualizado com `allow write: if false;` em `/products` e `/barcode_reservations`; escrita remota exclusiva pelo Firebase Admin SDK (`apiSyncCatalog`).
+- [x] **Validação de payload no servidor sem `any`**: `validateCatalogPayload` valida campos cadastrais, bloqueia caracteres de controle ASCII no barcode, valida preços não-negativos e finitos, restringe unidades ao enum `VALID_PRODUCT_UNITS`, valida/higieniza NCM e exige booleano estrito para `isActive`.
+- [x] **Unicidade de código de barras na nuvem**: Controle transacional de reservas em `/tenants/{tenantId}/barcode_reservations/{barcode}` vinculado ao `productId`, com liberação atômica ao alterar o barcode e suporte a produtos inativos.
+- [x] **Resiliência de convites e claims**: Consumo de convite executado dentro de `firestore.runTransaction` validando status `PENDING`, prazo de validade, destinatário (`targetUid`/`email`) e role; adota estado transitório `CLAIMS_PENDING` no Firestore para garantir recuperação idempotente sem corromper o convite em caso de falha transitória do Auth SDK.
+- [x] **Trilha de auditoria com fail-closed**: Remoção de qualquer bypass de auditoria; falha ao registrar auditoria de privilégios gera `AUDIT_FAILURE` imediato bloqueando a operação de segurança.
+- [x] **CI e Workflow Scope**: Workflow `.github/workflows/ci.yml` pronto e verificado.
+
+**Aceite:** 17 suítes de teste automatizadas em `test-verification.ts` 100% aprovadas; estoque remoto blindado contra sobrescrita; permissões, validações e convites transacionais comprovados.
 
 ## Task 7 — Reconstruir caixa por dados persistidos
 
