@@ -13,20 +13,20 @@ export interface CloudSaleResponse {
   success: boolean;
   idempotentRepeat?: boolean;
   saleId: string;
-  operationId?: string;
+  operationId: string;
   message?: string;
   error?: string;
 }
 
 export interface CloudCatalogResponse {
   success: boolean;
-  operationId?: string;
+  operationId: string;
   message?: string;
   error?: string;
 }
 
 export type CloudSaleDispatcherFn = (sale: Sale) => Promise<CloudSaleResponse>;
-export type CloudCatalogDispatcherFn = (payload: any, type: string) => Promise<CloudCatalogResponse>;
+export type CloudCatalogDispatcherFn = (payload: any, type: string, operationId?: string) => Promise<CloudCatalogResponse>;
 
 /**
  * Cliente HTTP para comunicação com o backend transacional na nuvem (Firebase Cloud Functions).
@@ -103,10 +103,29 @@ export class CloudApiClient {
           res?.error || res?.message || 'Dispatcher retornou resposta de erro (success !== true).'
         );
       }
-      if (res.saleId && res.saleId !== sale.id) {
+      if (!res.saleId || typeof res.saleId !== 'string' || res.saleId.trim() === '') {
+        throw new CloudResponseError(
+          'MISSING_SALE_ID',
+          'Dispatcher de venda não retornou o saleId obrigatório.'
+        );
+      }
+      if (res.saleId !== sale.id) {
         throw new CloudResponseError(
           'DIVERGENT_SALE_ID',
           `saleId retornado pelo dispatcher ("${res.saleId}") difere do enviado ("${sale.id}").`
+        );
+      }
+      const sentOpId = sale.operationId || sale.id;
+      if (!res.operationId || typeof res.operationId !== 'string' || res.operationId.trim() === '') {
+        throw new CloudResponseError(
+          'MISSING_OPERATION_ID',
+          'Dispatcher de venda não retornou o operationId obrigatório.'
+        );
+      }
+      if (res.operationId !== sentOpId) {
+        throw new CloudResponseError(
+          'DIVERGENT_OPERATION_ID',
+          `operationId retornado pelo dispatcher ("${res.operationId}") difere do enviado ("${sentOpId}").`
         );
       }
       return res;
@@ -173,8 +192,14 @@ export class CloudApiClient {
       throw new CloudResponseError(`REMOTE_ERROR_${response.status}`, errorMessage);
     }
 
-    // Validação estrita de coerência de identificadores
-    if (data.saleId && data.saleId !== sale.id) {
+    // Validação estrita de identificadores obrigatórios
+    if (!data.saleId || typeof data.saleId !== 'string' || data.saleId.trim() === '') {
+      throw new CloudResponseError(
+        'MISSING_SALE_ID',
+        'Resposta da nuvem não contém o saleId obrigatório.'
+      );
+    }
+    if (data.saleId !== sale.id) {
       throw new CloudResponseError(
         'DIVERGENT_SALE_ID',
         `saleId retornado ("${data.saleId}") diverge do enviado ("${sale.id}").`
@@ -182,7 +207,13 @@ export class CloudApiClient {
     }
 
     const sentOpId = sale.operationId || sale.id;
-    if (data.operationId && data.operationId !== sentOpId) {
+    if (!data.operationId || typeof data.operationId !== 'string' || data.operationId.trim() === '') {
+      throw new CloudResponseError(
+        'MISSING_OPERATION_ID',
+        'Resposta da nuvem não contém o operationId obrigatório.'
+      );
+    }
+    if (data.operationId !== sentOpId) {
       throw new CloudResponseError(
         'DIVERGENT_OPERATION_ID',
         `operationId retornado ("${data.operationId}") diverge do enviado ("${sentOpId}").`
@@ -192,8 +223,8 @@ export class CloudApiClient {
     return {
       success: true,
       idempotentRepeat: !!data.idempotentRepeat,
-      saleId: data.saleId || sale.id,
-      operationId: data.operationId || sentOpId,
+      saleId: data.saleId,
+      operationId: data.operationId,
       message: data.message || 'Venda transacionada na nuvem com sucesso.',
     };
   }
@@ -201,16 +232,38 @@ export class CloudApiClient {
   /**
    * Dispara a transação de catálogo (upsert ou toggle de produto) para a nuvem.
    */
-  public static async processCatalogTransaction(payload: any, type: string): Promise<CloudCatalogResponse> {
+  public static async processCatalogTransaction(
+    payload: any,
+    type: string,
+    operationId?: string
+  ): Promise<CloudCatalogResponse> {
+    const expectedOpId = operationId || payload?.operationId || (payload?.id ? `op_cat_${payload.id}` : undefined);
+
     if (this.mockCatalogDispatcher) {
-      const res = await this.mockCatalogDispatcher(payload, type);
+      const res = await this.mockCatalogDispatcher(payload, type, expectedOpId);
       if (!res || res.success !== true) {
         throw new CloudResponseError(
           'REJECTED_RESPONSE',
           res?.error || res?.message || 'Mock catalog dispatcher rejeitou a operação.'
         );
       }
-      return res;
+      if (!res.operationId || typeof res.operationId !== 'string' || res.operationId.trim() === '') {
+        throw new CloudResponseError(
+          'MISSING_OPERATION_ID',
+          'Dispatcher de catálogo não retornou o operationId obrigatório.'
+        );
+      }
+      if (expectedOpId && res.operationId !== expectedOpId) {
+        throw new CloudResponseError(
+          'DIVERGENT_OPERATION_ID',
+          `operationId retornado pelo dispatcher de catálogo ("${res.operationId}") diverge do esperado ("${expectedOpId}").`
+        );
+      }
+      return {
+        success: true,
+        operationId: res.operationId,
+        message: res.message,
+      };
     }
 
     let token: string | null = null;
@@ -232,7 +285,7 @@ export class CloudApiClient {
     const response = await fetch(this.catalogBackendUrl, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ type, payload }),
+      body: JSON.stringify({ type, payload, operationId: expectedOpId }),
     });
 
     const contentType = response.headers.get('content-type') || '';
@@ -248,6 +301,19 @@ export class CloudApiClient {
     if (!response.ok || data?.success !== true) {
       const errMsg = data?.error || data?.message || `HTTP_${response.status}`;
       throw new CloudResponseError(`REMOTE_ERROR_${response.status}`, errMsg);
+    }
+
+    if (!data.operationId || typeof data.operationId !== 'string' || data.operationId.trim() === '') {
+      throw new CloudResponseError(
+        'MISSING_OPERATION_ID',
+        'Resposta do catálogo não contém o operationId obrigatório.'
+      );
+    }
+    if (expectedOpId && data.operationId !== expectedOpId) {
+      throw new CloudResponseError(
+        'DIVERGENT_OPERATION_ID',
+        `operationId retornado pelo catálogo ("${data.operationId}") diverge do esperado ("${expectedOpId}").`
+      );
     }
 
     return {

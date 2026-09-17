@@ -344,66 +344,83 @@ export class LocalDatabase {
     };
 
     // Executa em transação atômica para evitar race conditions em validação concorrente de barcode
-    await this.driver.transaction(async (tx) => {
-      const existingBarcode = await tx.query<{ id: string; name: string }>(
-        'SELECT id, name FROM local_products WHERE barcode = ? AND tenant_id = ? AND id != ? AND is_active = 1;',
-        [barcode, targetTenant, id]
-      );
-      if (existingBarcode.length > 0) {
-        throw new Error(`Código de barras "${barcode}" já está em uso pelo produto "${existingBarcode[0].name}" no tenant "${targetTenant}".`);
+    try {
+      await this.driver.transaction(async (tx) => {
+        const existingBarcode = await tx.query<{ id: string; name: string }>(
+          'SELECT id, name FROM local_products WHERE barcode = ? AND tenant_id = ? AND id != ?;',
+          [barcode, targetTenant, id]
+        );
+        if (existingBarcode.length > 0) {
+          throw new ValidationError(
+            'barcode',
+            `Código de barras "${barcode}" já está em uso pelo produto "${existingBarcode[0].name}" no tenant "${targetTenant}".`
+          );
+        }
+
+        await tx.execute(
+          `INSERT INTO local_products (
+            id, tenant_id, name, barcode, cost_price, selling_price,
+            min_stock, current_stock, unit, category, ncm, is_active, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            barcode = excluded.barcode,
+            cost_price = excluded.cost_price,
+            selling_price = excluded.selling_price,
+            min_stock = excluded.min_stock,
+            current_stock = excluded.current_stock,
+            unit = excluded.unit,
+            category = excluded.category,
+            ncm = excluded.ncm,
+            is_active = excluded.is_active,
+            updated_at = excluded.updated_at;`,
+          [
+            product.id,
+            product.tenantId,
+            product.name,
+            product.barcode,
+            product.costPrice,
+            product.sellingPrice,
+            product.minStock,
+            product.currentStock,
+            product.unit,
+            product.category,
+            product.ncm || null,
+            product.isActive ? 1 : 0,
+            now,
+          ]
+        );
+
+        // Enfileira evento de catálogo na Outbox transacionalmente
+        const operationId = `op_cat_upsert_${product.id}_${now}`;
+        const outboxId = `outbox_${operationId}`;
+        await tx.execute(
+          `INSERT INTO outbox_operations (
+            id, tenant_id, type, operation_id, payload, status, attempts, next_attempt_at, processing_deadline, created_at, updated_at
+          ) VALUES (?, ?, 'CATALOG_PRODUCT_UPSERT', ?, ?, 'PENDING', 0, 0, 0, ?, ?);`,
+          [
+            outboxId,
+            product.tenantId,
+            operationId,
+            JSON.stringify(product),
+            now,
+            now,
+          ]
+        );
+      });
+    } catch (err) {
+      if (err instanceof ValidationError) {
+        throw err;
       }
-
-      await tx.execute(
-        `INSERT INTO local_products (
-          id, tenant_id, name, barcode, cost_price, selling_price,
-          min_stock, current_stock, unit, category, ncm, is_active, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          name = excluded.name,
-          barcode = excluded.barcode,
-          cost_price = excluded.cost_price,
-          selling_price = excluded.selling_price,
-          min_stock = excluded.min_stock,
-          current_stock = excluded.current_stock,
-          unit = excluded.unit,
-          category = excluded.category,
-          ncm = excluded.ncm,
-          is_active = excluded.is_active,
-          updated_at = excluded.updated_at;`,
-        [
-          product.id,
-          product.tenantId,
-          product.name,
-          product.barcode,
-          product.costPrice,
-          product.sellingPrice,
-          product.minStock,
-          product.currentStock,
-          product.unit,
-          product.category,
-          product.ncm || null,
-          product.isActive ? 1 : 0,
-          now,
-        ]
-      );
-
-      // Enfileira evento de catálogo na Outbox transacionalmente
-      const operationId = `op_cat_upsert_${product.id}_${now}`;
-      const outboxId = `outbox_${operationId}`;
-      await tx.execute(
-        `INSERT INTO outbox_operations (
-          id, tenant_id, type, operation_id, payload, status, attempts, next_attempt_at, processing_deadline, created_at, updated_at
-        ) VALUES (?, ?, 'CATALOG_PRODUCT_UPSERT', ?, ?, 'PENDING', 0, 0, 0, ?, ?);`,
-        [
-          outboxId,
-          product.tenantId,
-          operationId,
-          JSON.stringify(product),
-          now,
-          now,
-        ]
-      );
-    });
+      const errStr = err instanceof Error ? err.message : String(err);
+      if (errStr.includes('UNIQUE constraint failed') && errStr.includes('barcode')) {
+        throw new ValidationError(
+          'barcode',
+          `Código de barras "${barcode}" já está em uso no tenant "${targetTenant}".`
+        );
+      }
+      throw err;
+    }
 
     // Atualiza imediatamente o cache em memória do tenant ativo
     await this.loadProductsIntoCache(targetTenant);
@@ -421,7 +438,7 @@ export class LocalDatabase {
     }
 
     const now = Date.now();
-    return await this.driver.transaction(async (tx) => {
+    const result = await this.driver.transaction(async (tx) => {
       const rows = await tx.query<{ is_active: number }>(
         'SELECT is_active FROM local_products WHERE id = ? AND tenant_id = ?;',
         [productId, targetTenant]
@@ -460,6 +477,10 @@ export class LocalDatabase {
 
       return newStatus === 1;
     });
+
+    // Atualiza imediatamente o cache em memória do tenant ativo
+    await this.loadProductsIntoCache(targetTenant);
+    return result;
   }
 
   /**

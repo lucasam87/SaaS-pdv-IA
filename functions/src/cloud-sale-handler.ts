@@ -6,6 +6,7 @@ export interface CloudSaleResult {
   success: boolean;
   idempotentRepeat: boolean;
   saleId: string;
+  operationId: string;
   message?: string;
   negativeStockSignals?: SystemSignal[];
 }
@@ -299,6 +300,7 @@ export class CloudSaleHandler {
         success: true,
         idempotentRepeat: true,
         saleId: sale.id,
+        operationId: opId,
         message: `Operação "${opId}" já processada com sucesso anteriormente. Re-execução ignorada.`,
       };
     }
@@ -431,6 +433,7 @@ export class CloudSaleHandler {
       success: true,
       idempotentRepeat: false,
       saleId: sale.id,
+      operationId: opId,
       negativeStockSignals: negativeSignals.length > 0 ? negativeSignals : undefined,
     };
   }

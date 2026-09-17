@@ -168,6 +168,62 @@ Base: revisão do [commit ad2f3bb](https://github.com/lucasam87/SaaS-pdv-IA/comm
 | Validação | `npm --workspace=@pdv/desktop run build` (sucesso), `npm --workspace=functions run build` (sucesso) e `npx tsx test-verification.ts` (16 suítes / 16 aprovadas). |
 | Evidências | Testes automatizados executados com saída de código 0 cobrindo snapshots, rollback, NCM, barcode uniqueness, outbox catalog routing, cloud response validation, dinheiro/troco, SHA-256 idempotency, claims audit e mutex exclusivity. |
 | Limitações | Emuladores Firestore e testes com hardware térmico USB físico pertencem à homologação de Tasks 9 e 10. |
+| Próximo passo | Task 6.6 — Fechamento Técnico da Estabilização. |
+
+## Task 6.6 — Fechamento Técnico da Estabilização
+
+**Arquivos alterados:** `functions/src/endpoints/catalog-endpoint.ts`, `functions/src/endpoints/auth-claims-endpoint.ts`, `functions/src/cloud-sale-handler.ts`, `functions/src/index.ts`, `apps/desktop/src/db/sqlite-driver.ts`, `apps/desktop/src/db/local-db.ts`, `apps/desktop/src/services/cloud-api-client.ts`, `apps/desktop/src/services/sync-worker-client.ts`, `firebase/firestore.rules`, `.github/workflows/ci.yml`, `test-verification.ts`.
+
+### Ações Executadas
+
+- [x] **Backend Real de Sincronização de Catálogo (`apiSyncCatalog`)**:
+  - Implementação completa com verificação de Firebase ID Token (`verifyAuthToken`).
+  - Validação estrita de correspondência entre o `tenantId` da credencial e o payload.
+  - Autorização de papéis: permissão restrita a `ADMIN` e `MANAGER` (`assertCatalogPermissions`), com bloqueio estrito de `CASHIER` e tentativas cross-tenant.
+  - Idempotência canônica SHA-256 (`computeCanonicalCatalogHash`) baseada nos atributos comerciais do produto/toggle.
+  - Detecção e rejeição imediata com `INTEGRITY_CONFLICT` caso o mesmo `operationId` seja reutilizado com payload divergente.
+  - Transação atômica no Firestore (`RealFirestoreCatalogTransactionAdapter`) com todas as leituras anteriores às escritas, gravando produto e comprovante na coleção `operations`.
+  - Exportação oficial da Cloud Function em `functions/src/index.ts`.
+- [x] **Endurecimento do Contrato de Respostas Remotas (`CloudApiClient`)**:
+  - `CloudSaleResponse` e `CloudCatalogResponse` agora exigem obrigatoriamente `operationId` e `saleId` válidos (eliminação de `{ success: true }` sem comprovação).
+  - Validação de correspondência exata de `operationId` e `saleId` retornados contra a requisição enviada.
+  - Alinhamento do `CloudSaleHandler` e `apiProcessSale` para sempre retornarem `operationId` tanto em novas vendas quanto em repetições idempotentes.
+  - Aplicação dos mesmos critérios estritos de validação aos dispatchers mock para testes determinísticos.
+- [x] **Correção de Persistência Pós-COMMIT no `BrowserSqliteDriver`**:
+  - Separação estrita entre a confirmação do `COMMIT;` no SQLite e o snapshot no IndexedDB.
+  - NUNCA executar `ROLLBACK;` após o `COMMIT;` ter sido confirmado no motor SQLite em memória.
+  - Transição de estado explícita para `COMMITTED_BUT_NOT_PERSISTED` e sinalização `hasPendingStoragePersistence() === true` caso o snapshot no storage falhe.
+  - Método `retryPersistence()` permitindo retentativa limpa de gravação de snapshot sem reexecutar a lógica de negócio.
+- [x] **Unificação da Regra de Unicidade de Código de Barras**:
+  - Produtos inativos continuam reservando o código de barras no banco, alinhando com a constraint `UNIQUE(tenant_id, barcode)`.
+  - Remoção de `AND is_active = 1` da query preventiva no `local-db.ts`.
+  - Retorno de erro tipado `ValidationError('barcode', ...)` ao detectar colisão de código de barras.
+  - Atualização do cache em memória após `toggleProductStatus` com recarga imediata do tenant.
+- [x] **Endurecimento de `assignUserClaims` (Convites e Auditoria)**:
+  - Manutenção do bloqueio contra auto-elevação (`caller.uid === targetUid`) e transferência cross-tenant.
+  - Para usuários sem `tenantId` e sem vínculo prévio, exigência obrigatória de convite pendente em `tenants/{tenantId}/invites`.
+  - Consumo atômico do convite (`status: 'ACCEPTED'`).
+  - Registro de auditoria em `tenants/{tenantId}/audit_logs` para tentativas de sucesso e tentativas negadas.
+- [x] **Segurança no Firestore Rules (`firestore.rules`)**:
+  - Regras de segurança adicionadas para as coleções `invites` e `audit_logs` sob cada `tenantId`.
+- [x] **Subtestes Automatizados e CI**:
+  - Adição dos subtestes 16.12, 16.13, 16.14, 16.15 e 16.16 no `test-verification.ts`.
+  - Adição do workflow de CI do GitHub Actions em `.github/workflows/ci.yml`.
+
+**Aceite:** Todos os 16 testes automatizados e subtestes 16.1 a 16.16 passam com 100% de sucesso. Workspaces `@pdv/desktop` e `functions` compilam com código 0.
+
+### Modelo de entrega — Task 6.6
+
+| Campo | Preencher após execução |
+| --- | --- |
+| Task e estado | **Task 6.6 — Concluída com 100% de aprovação** |
+| Versão examinada | Commit base `85d4f40` na branch `fix/audit-hardening` |
+| Diagnóstico | Ausência de endpoint real de sincronização de catálogo na nuvem, contrato permissivo de respostas remotas sem IDs obrigatórios, rollback indevido no BrowserSqliteDriver após commit confirmado, colisão de código de barras permitida em produtos inativos pela query preventiva, apropriação indevida de empresa por UID no `assignUserClaims` sem validação de convite, e ausência de pipeline de CI. |
+| Arquivos alterados | `functions/src/endpoints/catalog-endpoint.ts`, `functions/src/endpoints/auth-claims-endpoint.ts`, `functions/src/cloud-sale-handler.ts`, `functions/src/index.ts`, `apps/desktop/src/db/sqlite-driver.ts`, `apps/desktop/src/db/local-db.ts`, `apps/desktop/src/services/cloud-api-client.ts`, `apps/desktop/src/services/sync-worker-client.ts`, `firebase/firestore.rules`, `.github/workflows/ci.yml`, `test-verification.ts`, `STATUS_PROJETO.md`, `TASKS_CORRECAO_PDV.md`. |
+| Correção | Endpoint `apiSyncCatalog` funcional com idempotência canônica SHA-256 e atomicidade Firestore; contrato de resposta rígido com `saleId` e `operationId` obrigatórios no `CloudApiClient`; `BrowserSqliteDriver` com separação de commit e snapshot e estado `COMMITTED_BUT_NOT_PERSISTED`; reserva de barcode por produtos inativos com `ValidationError`; consumo atômico de convites e auditoria no `assignUserClaims`; workflow `.github/workflows/ci.yml`. |
+| Validação | `npm --workspace=@pdv/desktop run build` (sucesso, código 0), `npm --workspace=functions run build` (sucesso, código 0), `npx tsx test-verification.ts` (16 suítes e subtestes 16.12 a 16.16 com código 0). |
+| Evidências | Testes automatizados executados comprovando catálogo na nuvem, contrato de resposta, durabilidade pós-commit, unicidade de barcode com inativos, convites de tenant e trilha de auditoria. |
+| Limitações | Não configurado Docker e Task 7 não iniciada (conforme restrição do escopo). |
 | Próximo passo | Task 7 — Reconstruir caixa por dados persistidos. |
 
 ## Task 7 — Reconstruir caixa por dados persistidos

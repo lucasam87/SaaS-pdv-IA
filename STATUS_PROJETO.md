@@ -63,6 +63,13 @@ Foram executadas baterias de testes com **16 suítes automatizadas (`test-verifi
   - **Idempotência Canônica SHA-256 no Servidor**: Hash criptográfico determinístico gerado sobre os campos comerciais da venda; mesma `operationId` com dados alterados rejeitada com `INTEGRITY_CONFLICT`; `sale.id` reutilizado em operações diferentes bloqueado.
   - **Atribuição de Permissões Segura (`assignUserClaims`)**: Bloqueio de auto-elevação de privilégios (`caller.uid === targetUid`), validação de que o usuário alvo pertence ao tenant do administrador chamador e registro de trilha de auditoria em `tenants/{tenantId}/audit_logs`.
   - **Exclusividade de Conexão no SQLite**: Fila assíncrona `AsyncMutex` impedindo que queries diretas concorram com transações abertas; driver contextual com comandos diretos internos evitando deadlocks.
+- [x] **Task 6.6 — Fechamento Técnico da Estabilização**:
+  - **Backend Real de Catálogo (`apiSyncCatalog`)**: Endpoint seguro com Firebase ID Token, validação estrita de `tenantId`, autorização de papéis (`ADMIN`/`MANAGER` permitidos, `CASHIER` bloqueado), idempotência criptográfica SHA-256 e transação atômica no Firestore gravando produto e operação.
+  - **Endurecimento do Contrato de Respostas (`CloudApiClient`)**: Obrigatoriedade de `saleId` e `operationId` correspondentes nas vendas e `operationId` no catálogo, tanto no cliente HTTP real quanto nos dispatchers mock.
+  - **Separação de COMMIT e Snapshot no `BrowserSqliteDriver`**: O SQLite nunca executa `ROLLBACK;` após um `COMMIT;` confirmado; falhas de snapshot no IndexedDB transicionam o driver para `COMMITTED_BUT_NOT_PERSISTED`, com retentativa via `retryPersistence()`.
+  - **Unificação de Unicidade de Código de Barras**: Produtos inativos continuam reservando o código de barras no banco (`UNIQUE(tenant_id, barcode)`); query preventiva no `local-db.ts` atualizada sem filtro de `is_active = 1`, retornando `ValidationError` tipado.
+  - **Endurecimento de Permissões (`assignUserClaims`)**: Exigência de convite pendente em `tenants/{tenantId}/invites` para novos usuários sem `tenantId`, consumo atômico do convite e trilha de auditoria completa em `tenants/{tenantId}/audit_logs` para sucessos e tentativas negadas.
+  - **Pipeline de Integração Contínua (CI)**: Workflow do GitHub Actions (`.github/workflows/ci.yml`) executando builds e suíte de testes automatizados a cada push e PR.
 
 ---
 

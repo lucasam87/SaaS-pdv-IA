@@ -8,4 +8,5 @@ export * from './sync-worker';
 export * from './cloud-sale-handler';
 export * from './endpoints/sale-endpoint';
 export * from './endpoints/auth-claims-endpoint';
+export * from './endpoints/catalog-endpoint';
 

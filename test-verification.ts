@@ -25,6 +25,12 @@ import {
 import { executeNightGraph } from './functions/src/ai-graph/night-graph';
 import { Product, Sale, Tenant, TenantSettings, CashSession, StockMovement } from './packages/shared/src';
 import { assertTenantAdmin, assignUserClaims } from './functions/src/endpoints/auth-claims-endpoint';
+import {
+  executeCatalogTransactionLogic,
+  FirestoreCatalogTransactionContext,
+  assertCatalogPermissions,
+  computeCanonicalCatalogHash,
+} from './functions/src/endpoints/catalog-endpoint';
 import { AuthenticatedUserContext, verifyAuthToken } from './functions/src/endpoints/sale-endpoint';
 
 async function runRigorousVerification() {
@@ -1286,6 +1292,7 @@ async function runRigorousVerification() {
     return {
       success: true,
       saleId: s.id,
+      operationId: s.operationId,
       idempotentRepeat: false,
     };
   });
@@ -2509,7 +2516,390 @@ async function runRigorousVerification() {
   await testDriver.close();
   localDb.setActiveTenantId(tenantId);
   console.log('  ✓ Exclusividade de transação SQLite garantida sem colisões ou deadlocks.');
-  console.log('  ✓ Critérios de aceite da Task 6.5 plenamente comprovados com excelência.\n');
+
+  // -------------------------------------------------------------------------
+  // TASK 6.6: Subtestes de Hardening e Fechamento Técnico da Estabilização
+  // -------------------------------------------------------------------------
+
+  // 12. Backend Real de Sincronização de Catálogo (apiSyncCatalog / executeCatalogTransactionLogic)
+  console.log('  [16.12] Testando backend de catálogo (permissões, isolamento, idempotência e divergência)...');
+  // Validação de papéis: ADMIN e MANAGER permitidos, CASHIER rejeitado
+  assertCatalogPermissions({ uid: 'admin_1', tenantId: tenantA, role: 'ADMIN' }, tenantA);
+  assertCatalogPermissions({ uid: 'mgr_1', tenantId: tenantA, role: 'MANAGER' }, tenantA);
+  assert.throws(
+    () => assertCatalogPermissions({ uid: 'cashier_1', tenantId: tenantA, role: 'CASHIER' }, tenantA),
+    /PERMISSION_DENIED/,
+    'CASHIER não pode sincronizar catálogo'
+  );
+  assert.throws(
+    () => assertCatalogPermissions({ uid: 'admin_cross', tenantId: 'tenant_other', role: 'ADMIN' }, tenantA),
+    /PERMISSION_DENIED/,
+    'Admin de outro tenant não pode alterar catálogo'
+  );
+
+  const catProducts = new Map<string, any>();
+  const catOperations = new Map<string, any>();
+  const catTxContext: FirestoreCatalogTransactionContext = {
+    async getOperation(tId, opId) {
+      return catOperations.get(`${tId}_${opId}`) || null;
+    },
+    async getProduct(tId, pId) {
+      return catProducts.get(`${tId}_${pId}`) || null;
+    },
+    async saveProduct(tId, product) {
+      catProducts.set(`${tId}_${product.id}`, { ...product });
+    },
+    async updateProductStatus(tId, pId, isActive, updatedAt) {
+      const p = catProducts.get(`${tId}_${pId}`);
+      if (p) {
+        catProducts.set(`${tId}_${pId}`, { ...p, isActive, updatedAt });
+      }
+    },
+    async recordOperation(tId, opId, data) {
+      catOperations.set(`${tId}_${opId}`, { ...data });
+    },
+  };
+
+  const testProdPayload = {
+    id: 'cat_prod_1',
+    tenantId: tenantA,
+    name: 'Produto Catálogo Teste',
+    barcode: '7891234567890',
+    costPrice: 10,
+    sellingPrice: 20,
+    minStock: 5,
+    currentStock: 100,
+    unit: 'UN',
+    isActive: true,
+  };
+
+  // 1ª Execução: Inserção atômica do produto e comprovante
+  const catRes1 = await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_UPSERT',
+    testProdPayload,
+    'op_cat_1',
+    catTxContext
+  );
+  assert.strictEqual(catRes1.success, true);
+  assert.strictEqual(catRes1.operationId, 'op_cat_1');
+  assert.strictEqual(catRes1.idempotentRepeat, false);
+  assert.strictEqual(catProducts.get(`${tenantA}_cat_prod_1`)?.name, 'Produto Catálogo Teste');
+
+  // 2ª Execução: Repetição idempotente com mesmo operationId e conteúdo idêntico
+  const catRes2 = await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_UPSERT',
+    testProdPayload,
+    'op_cat_1',
+    catTxContext
+  );
+  assert.strictEqual(catRes2.success, true);
+  assert.strictEqual(catRes2.operationId, 'op_cat_1');
+  assert.strictEqual(catRes2.idempotentRepeat, true);
+
+  // 3ª Execução: Mesmo operationId com conteúdo divergente deve lançar INTEGRITY_CONFLICT
+  await assert.rejects(
+    async () =>
+      executeCatalogTransactionLogic(
+        tenantA,
+        'CATALOG_PRODUCT_UPSERT',
+        { ...testProdPayload, name: 'Produto Modificado Conflitante' },
+        'op_cat_1',
+        catTxContext
+      ),
+    /INTEGRITY_CONFLICT/,
+    'Deve rejeitar payload divergente para mesmo operationId'
+  );
+
+  // 4ª Execução: Toggle status atômico
+  const togglePayload = {
+    productId: 'cat_prod_1',
+    tenantId: tenantA,
+    isActive: false,
+    updatedAt: Date.now(),
+  };
+  const catRes3 = await executeCatalogTransactionLogic(
+    tenantA,
+    'CATALOG_PRODUCT_TOGGLE',
+    togglePayload,
+    'op_cat_toggle_1',
+    catTxContext
+  );
+  assert.strictEqual(catRes3.success, true);
+  assert.strictEqual(catRes3.operationId, 'op_cat_toggle_1');
+  assert.strictEqual(catProducts.get(`${tenantA}_cat_prod_1`)?.isActive, false);
+  console.log('  ✓ Backend real de catálogo (permissões, idempotência, divergência) validado.');
+
+  // 13. Endurecimento do Contrato de Respostas Remotas (CloudApiClient)
+  console.log('  [16.13] Testando endurecimento do contrato de respostas no CloudApiClient...');
+  // Resposta de venda sem saleId ou operationId
+  CloudApiClient.setMockDispatcher(async () => ({ success: true } as any));
+  await assert.rejects(
+    async () => CloudApiClient.processSaleTransaction(cashSale),
+    (err: any) => err instanceof CloudResponseError && (err.code === 'MISSING_SALE_ID' || err.code === 'MISSING_OPERATION_ID'),
+    'Deve rejeitar resposta de venda sem saleId e operationId'
+  );
+
+  // Resposta de venda com operationId divergente da requisição
+  CloudApiClient.setMockDispatcher(async () => ({
+    success: true,
+    saleId: cashSale.id,
+    operationId: 'op_divergent_id_diff',
+  }));
+  await assert.rejects(
+    async () => CloudApiClient.processSaleTransaction(cashSale),
+    (err: any) => err instanceof CloudResponseError && err.code === 'DIVERGENT_OPERATION_ID',
+    'Deve rejeitar resposta com operationId divergente'
+  );
+
+  // Resposta de venda válida com saleId e operationId correspondentes
+  CloudApiClient.setMockDispatcher(async () => ({
+    success: true,
+    saleId: cashSale.id,
+    operationId: cashSale.operationId,
+  }));
+  const saleValidRes = await CloudApiClient.processSaleTransaction(cashSale);
+  assert.strictEqual(saleValidRes.success, true);
+  assert.strictEqual(saleValidRes.operationId, cashSale.operationId);
+  CloudApiClient.setMockDispatcher(null);
+
+  // Resposta de catálogo sem operationId
+  CloudApiClient.setMockCatalogDispatcher(async () => ({ success: true } as any));
+  await assert.rejects(
+    async () => CloudApiClient.processCatalogTransaction(testProdPayload, 'CATALOG_PRODUCT_UPSERT', 'op_cat_cli_1'),
+    (err: any) => err instanceof CloudResponseError && err.code === 'MISSING_OPERATION_ID',
+    'Deve rejeitar resposta de catálogo sem operationId'
+  );
+
+  // Resposta de catálogo com operationId divergente
+  CloudApiClient.setMockCatalogDispatcher(async () => ({ success: true, operationId: 'op_cat_cli_diff' }));
+  await assert.rejects(
+    async () => CloudApiClient.processCatalogTransaction(testProdPayload, 'CATALOG_PRODUCT_UPSERT', 'op_cat_cli_1'),
+    (err: any) => err instanceof CloudResponseError && err.code === 'DIVERGENT_OPERATION_ID',
+    'Deve rejeitar resposta de catálogo com operationId divergente'
+  );
+
+  // Resposta de catálogo válida
+  CloudApiClient.setMockCatalogDispatcher(async () => ({ success: true, operationId: 'op_cat_cli_1' }));
+  const catValidRes = await CloudApiClient.processCatalogTransaction(testProdPayload, 'CATALOG_PRODUCT_UPSERT', 'op_cat_cli_1');
+  assert.strictEqual(catValidRes.success, true);
+  assert.strictEqual(catValidRes.operationId, 'op_cat_cli_1');
+  CloudApiClient.setMockCatalogDispatcher(null);
+  console.log('  ✓ Contrato estrito de respostas remotas validado (rejeita ausência e divergência de IDs).');
+
+  // 14. Correção de persistência pós-COMMIT no BrowserSqliteDriver
+  console.log('  [16.14] Testando persistência pós-COMMIT no BrowserSqliteDriver (sem rollback indevido)...');
+  let simulateStorageFailure = false;
+  let savedStorageData: Uint8Array | null = null;
+  const mockStorageAdapter = {
+    async load(_key: string) { return null; },
+    async save(_key: string, data: Uint8Array) {
+      if (simulateStorageFailure) {
+        throw new Error('IndexedDB QuotaExceededError simulado pós-COMMIT');
+      }
+      savedStorageData = data;
+    },
+  };
+  const browserDriverDurability = new BrowserSqliteDriver({
+    tenantId: 'tenant_browser_test',
+    storageAdapter: mockStorageAdapter as any,
+  });
+  await browserDriverDurability.init();
+  await browserDriverDurability.execute('CREATE TABLE browser_durability_test (id INT, note TEXT);');
+
+  // Executa transação com falha simulada de persistência: confirma COMMIT no SQLite mas falha no persistToStorage()
+  simulateStorageFailure = true;
+  let caughtStorageErr: any = null;
+  try {
+    await browserDriverDurability.transaction(async (tx) => {
+      await tx.execute('INSERT INTO browser_durability_test VALUES (?, ?);', [101, 'committed_record']);
+    });
+  } catch (e) {
+    caughtStorageErr = e;
+  }
+  assert.ok(caughtStorageErr, 'Transação deve falhar indicando falha de snapshot');
+  assert.strictEqual(caughtStorageErr.code, 'COMMITTED_BUT_NOT_PERSISTED');
+
+  // VERIFICAÇÃO CRÍTICA: O SQLite em memória NÃO PODE ter sido revertido!
+  const inMemRows = await browserDriverDurability.query('SELECT * FROM browser_durability_test;');
+  assert.strictEqual(inMemRows.length, 1, 'Registro inserido DEVE existir no SQLite em memória (COMMIT confirmado).');
+  assert.strictEqual((inMemRows[0] as any).note, 'committed_record');
+  assert.strictEqual(browserDriverDurability.getPersistenceState(), 'COMMITTED_BUT_NOT_PERSISTED');
+  assert.strictEqual(browserDriverDurability.hasPendingStoragePersistence(), true);
+
+  // Recupera falha do storage e executa retryPersistence()
+  simulateStorageFailure = false;
+  await browserDriverDurability.retryPersistence();
+  assert.strictEqual(browserDriverDurability.getPersistenceState(), 'PERSISTED');
+  assert.strictEqual(browserDriverDurability.hasPendingStoragePersistence(), false);
+  assert.ok(savedStorageData && savedStorageData.length > 0, 'Storage deve ter recebido o snapshot SQLite.');
+  await browserDriverDurability.close();
+  console.log('  ✓ BrowserSqliteDriver preserva COMMIT SQLite se snapshot falhar e suporta retryPersistence.');
+
+  // 15. Unificação da regra de unicidade de código de barras
+  console.log('  [16.15] Testando unicidade de código de barras incluindo produtos inativos...');
+  const uniqueBarcode = `789_unique_${Date.now()}`;
+  const pBase = await localDb.saveProduct({
+    name: 'Produto Base Original',
+    barcode: uniqueBarcode,
+    costPrice: 10,
+    sellingPrice: 20,
+    minStock: 2,
+    currentStock: 10,
+    unit: 'UN',
+  });
+  // Desativa o produto
+  await localDb.toggleProductStatus(pBase.id);
+  const dbRows = await (localDb as any).driver.query(
+    'SELECT is_active FROM local_products WHERE id = ?;',
+    [pBase.id]
+  );
+  assert.strictEqual(dbRows[0].is_active, 0, 'Produto pBase deve estar inativo no banco de dados.');
+  assert.strictEqual(localDb.findById(pBase.id), undefined, 'Produto inativo não deve constar no cache ativo do PDV.');
+
+  // Tenta cadastrar NOVO produto com o mesmo código de barras do produto inativo
+  let barcodeCollisionErr: any = null;
+  try {
+    await localDb.saveProduct({
+      name: 'Produto Concorrente Mesmo Barcode',
+      barcode: uniqueBarcode,
+      costPrice: 15,
+      sellingPrice: 30,
+      minStock: 5,
+      currentStock: 20,
+      unit: 'UN',
+    });
+  } catch (err) {
+    barcodeCollisionErr = err;
+  }
+  assert.ok(barcodeCollisionErr, 'Deve lançar erro ao tentar reutilizar código de barras de produto inativo.');
+  assert.ok(barcodeCollisionErr instanceof ValidationError, 'Erro deve ser ValidationError tipado.');
+  assert.strictEqual((barcodeCollisionErr as ValidationError).field, 'barcode');
+  console.log('  ✓ Código de barras de produtos inativos é reservado e lança ValidationError tipado.');
+
+  // 16. Endurecimento de assignUserClaims (convite pendente e auditoria)
+  console.log('  [16.16] Testando exigência de convite pendente e auditoria em assignUserClaims...');
+  const auditStore: any[] = [];
+  const inviteStore = new Map<string, any>();
+  const usersStore = new Map<string, any>();
+  const mockAuthUsers = new Map<string, any>([
+    ['user_without_invite', { uid: 'user_without_invite', email: 'noinvite@test.com', customClaims: {} }],
+    ['user_with_invite', { uid: 'user_with_invite', email: 'invited@test.com', customClaims: {} }],
+  ]);
+
+  const mockDeps = {
+    auth: {
+      async getUser(uid: string) {
+        const u = mockAuthUsers.get(uid);
+        if (!u) throw new Error('NOT_FOUND');
+        return u;
+      },
+      async setCustomUserClaims(uid: string, claims: Record<string, unknown>) {
+        const u = mockAuthUsers.get(uid);
+        if (u) u.customClaims = claims;
+      },
+      async revokeRefreshTokens(_uid: string) {},
+    },
+    firestore: {
+      doc(p: string) {
+        return {
+          async get() {
+            if (p.includes('/users/')) {
+              const uid = p.split('/users/')[1];
+              const data = usersStore.get(uid);
+              return { exists: !!data, data: () => data };
+            }
+            if (p.includes('/invites/')) {
+              const invId = p.split('/invites/')[1];
+              const data = inviteStore.get(invId);
+              return { exists: !!data, data: () => data };
+            }
+            return { exists: false };
+          },
+          async set(data: any) {
+            if (p.includes('/users/')) {
+              const uid = p.split('/users/')[1];
+              usersStore.set(uid, data);
+            }
+            if (p.includes('/invites/')) {
+              const invId = p.split('/invites/')[1];
+              inviteStore.set(invId, data);
+            }
+            if (p.includes('/audit_logs/')) {
+              auditStore.push(data);
+            }
+          },
+        };
+      },
+      collection(_p: string) {
+        return {
+          doc() {
+            const id = `audit_${Date.now()}_${Math.random().toString(36).substring(2)}`;
+            return {
+              id,
+              async set(data: any) {
+                auditStore.push({ id, ...data });
+              },
+            };
+          },
+          where(field: string, _op: string, val: any) {
+            return {
+              where() { return this; },
+              async get() {
+                const results: any[] = [];
+                for (const [id, inv] of inviteStore.entries()) {
+                  if (inv[field] === val && inv.status === 'PENDING') {
+                    results.push({ id, data: () => inv, ref: null });
+                  }
+                }
+                return { docs: results };
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+
+  // Tentativa de atribuir claims a usuário sem tenant e sem convite: DEVE REJEITAR
+  await assert.rejects(
+    async () => assignUserClaims(adminCaller, 'user_without_invite', tenantA, 'CASHIER', undefined, mockDeps as any),
+    (err: any) => err.message.includes('PERMISSION_DENIED') && err.message.includes('não possui convite pendente')
+  );
+  const deniedLog = auditStore.find((l) => l.action === 'ASSIGN_USER_CLAIMS_DENIED' && l.targetUserId === 'user_without_invite');
+  assert.ok(deniedLog, 'Tentativa negada deve ser registrada no log de auditoria.');
+
+  // Cria convite pendente e tenta atribuição
+  inviteStore.set('invite_valid_123', {
+    id: 'invite_valid_123',
+    targetUid: 'user_with_invite',
+    status: 'PENDING',
+    role: 'CASHIER',
+  });
+
+  const assignResult = await assignUserClaims(
+    adminCaller,
+    'user_with_invite',
+    tenantA,
+    'CASHIER',
+    'invite_valid_123',
+    mockDeps as any
+  );
+  assert.strictEqual(assignResult.success, true);
+  assert.strictEqual(assignResult.role, 'CASHIER');
+  assert.strictEqual(mockAuthUsers.get('user_with_invite')?.customClaims?.tenantId, tenantA);
+
+  const consumedInvite = inviteStore.get('invite_valid_123');
+  assert.strictEqual(consumedInvite.status, 'ACCEPTED');
+  assert.strictEqual(consumedInvite.consumedBy, 'user_with_invite');
+
+  const successLog = auditStore.find((l) => l.action === 'ASSIGN_USER_CLAIMS' && l.targetUserId === 'user_with_invite');
+  assert.ok(successLog, 'Sucesso de atribuição deve ser registrado no audit log com inviteId.');
+  assert.strictEqual(successLog.inviteId, 'invite_valid_123');
+  console.log('  ✓ assignUserClaims exige e consome convite pendente e audita tentativas com sucesso.');
+
+  console.log('  ✓ Critérios de aceite da Task 6.6 plenamente comprovados com excelência.\n');
 }
 
 runRigorousVerification().catch((err) => {

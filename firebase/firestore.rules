@@ -76,6 +76,20 @@ service cloud.firestore {
         allow write: if isTenantAdmin(tenantId);
       }
 
+      // Convites pendentes de novos membros para o tenant
+      match /invites/{inviteId} {
+        // Apenas admins podem gerenciar convites; o usuário convidado pode ler se for o destinatário
+        allow read: if isTenantAdmin(tenantId) || (isAuthenticated() && (resource.data.targetUid == request.auth.uid || resource.data.email == request.auth.token.email));
+        allow create, update, delete: if isTenantAdmin(tenantId);
+      }
+
+      // Trilha de auditoria (atribuição de permissões, convites, tentativas negadas)
+      // Exclusivo para leitura por Administradores. Gravação apenas via Admin SDK (Cloud Functions).
+      match /audit_logs/{logId} {
+        allow read: if isTenantAdmin(tenantId);
+        allow write: if false;
+      }
+
       // Catálogo de Produtos e Lotes
       match /products/{productId} {
         allow read: if belongsToTenant(tenantId);

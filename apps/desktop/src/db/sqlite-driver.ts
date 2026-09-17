@@ -504,6 +504,8 @@ export interface BrowserSqliteDriverOptions {
   sqlModuleInit?: (config: any) => Promise<any>;
 }
 
+export type BrowserPersistenceState = 'IDLE' | 'PERSISTED' | 'COMMITTED_BUT_NOT_PERSISTED';
+
 /**
  * Driver para ambiente Web/Navegador utilizando WebAssembly (sql.js / SQLite compilado para WASM)
  * com persistência durável via IndexedDB, isolamento por tenant na chave e serialização de transações.
@@ -517,6 +519,9 @@ export class BrowserSqliteDriver implements ISqliteDriver {
   private schemaVersion: number;
   private storageAdapter: IBrowserStorageAdapter;
   private options: BrowserSqliteDriverOptions;
+  private persistenceState: BrowserPersistenceState = 'IDLE';
+  private hasPendingPersistence = false;
+  private lastPersistenceError: Error | null = null;
 
   constructor(options?: BrowserSqliteDriverOptions) {
     this.options = options || {};
@@ -532,6 +537,35 @@ export class BrowserSqliteDriver implements ISqliteDriver {
 
   public getStorageKey(): string {
     return `pdv_sqlite_${this.tenantId}_v${this.schemaVersion}`;
+  }
+
+  public getPersistenceState(): BrowserPersistenceState {
+    return this.persistenceState;
+  }
+
+  public hasPendingStoragePersistence(): boolean {
+    return this.hasPendingPersistence;
+  }
+
+  public getLastPersistenceError(): Error | null {
+    return this.lastPersistenceError;
+  }
+
+  public async retryPersistence(): Promise<void> {
+    const releaseLock = await this.mutex.acquire();
+    try {
+      await this.persistToStorage();
+      this.persistenceState = 'PERSISTED';
+      this.hasPendingPersistence = false;
+      this.lastPersistenceError = null;
+    } catch (err) {
+      this.persistenceState = 'COMMITTED_BUT_NOT_PERSISTED';
+      this.hasPendingPersistence = true;
+      this.lastPersistenceError = err instanceof Error ? err : new Error(String(err));
+      throw err;
+    } finally {
+      releaseLock();
+    }
   }
 
   public getTenantId(): string {
@@ -830,7 +864,17 @@ export class BrowserSqliteDriver implements ISqliteDriver {
         upper.startsWith('ALTER') ||
         upper.startsWith('DROP')
       ) {
-        await this.persistToStorage();
+        try {
+          await this.persistToStorage();
+          this.persistenceState = 'PERSISTED';
+          this.hasPendingPersistence = false;
+          this.lastPersistenceError = null;
+        } catch (storageErr) {
+          this.persistenceState = 'COMMITTED_BUT_NOT_PERSISTED';
+          this.hasPendingPersistence = true;
+          this.lastPersistenceError = storageErr instanceof Error ? storageErr : new Error(String(storageErr));
+          throw storageErr;
+        }
       }
     } finally {
       releaseLock();
@@ -897,8 +941,6 @@ export class BrowserSqliteDriver implements ISqliteDriver {
 
     try {
       this.executeInternal(db, 'COMMIT;');
-      // Persiste duravelmente no IndexedDB SOMENTE após o COMMIT confirmado
-      await this.persistToStorage();
     } catch (commitErr) {
       let rollbackErr: unknown = null;
       try {
@@ -916,6 +958,27 @@ export class BrowserSqliteDriver implements ISqliteDriver {
         );
       }
       throw new Error(`[BrowserSqliteDriver] Falha no COMMIT: ${commitMsg}`);
+    }
+
+    // COMMIT confirmado no SQLite! NUNCA fazer ROLLBACK a partir daqui.
+    try {
+      await this.persistToStorage();
+      this.persistenceState = 'PERSISTED';
+      this.hasPendingPersistence = false;
+      this.lastPersistenceError = null;
+    } catch (storageErr) {
+      this.persistenceState = 'COMMITTED_BUT_NOT_PERSISTED';
+      this.hasPendingPersistence = true;
+      const errorObj = storageErr instanceof Error ? storageErr : new Error(String(storageErr));
+      this.lastPersistenceError = errorObj;
+      releaseLock();
+
+      const compositeErr = new Error(
+        `[BrowserSqliteDriver] Transação SQLite confirmada (COMMITTED), porém a persistência no IndexedDB falhou: ${errorObj.message}. O driver está em estado COMMITTED_BUT_NOT_PERSISTED.`
+      );
+      (compositeErr as any).code = 'COMMITTED_BUT_NOT_PERSISTED';
+      (compositeErr as any).cause = errorObj;
+      throw compositeErr;
     }
 
     releaseLock();

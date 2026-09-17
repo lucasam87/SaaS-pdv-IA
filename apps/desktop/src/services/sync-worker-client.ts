@@ -117,7 +117,7 @@ export class SyncWorkerClient {
           if (op.type === 'CATALOG_PRODUCT_UPSERT' || op.type === 'CATALOG_PRODUCT_TOGGLE') {
             // Roteamento específico para eventos de catálogo (evita parse indevido como Sale)
             const payload = JSON.parse(op.payload);
-            const catalogPromise = CloudApiClient.processCatalogTransaction(payload, op.type);
+            const catalogPromise = CloudApiClient.processCatalogTransaction(payload, op.type, op.operationId);
             result = await Promise.race([catalogPromise, timeoutPromise]);
           } else {
             // Eventos de venda padrão (SALE_CREATED, etc.)
