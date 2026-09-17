@@ -33,7 +33,7 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ total, onConfirmPaym
     try {
       const payment: SalePayment = {
         method,
-        amount: total,
+        amount: method === 'DINHEIRO' ? numReceived : total,
         changeAmount: method === 'DINHEIRO' ? change : 0,
       };
       await onConfirmPayment([payment], customerName.trim() || undefined);

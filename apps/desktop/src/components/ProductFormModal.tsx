@@ -99,8 +99,6 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
 
   const costPrice = parseFloat(costPriceStr.replace(',', '.')) || 0;
   const sellingPrice = parseFloat(sellingPriceStr.replace(',', '.')) || 0;
-  const currentStock = parseFloat(currentStockStr.replace(',', '.')) || 0;
-  const minStock = parseFloat(minStockStr.replace(',', '.')) || 0;
 
   // Cálculo da Margem Bruta
   const profit = sellingPrice - costPrice;
@@ -141,9 +139,42 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
       return;
     }
 
-    if (sellingPrice <= 0) {
-      setErrorMsg('O preço de venda deve ser maior que R$ 0,00.');
+    if (/[\x00-\x1F\x7F]/.test(trimmedBarcode)) {
+      setErrorMsg('Código de barras contém caracteres inválidos.');
       return;
+    }
+
+    const parsedCost = parseFloat(costPriceStr.replace(',', '.'));
+    const parsedSelling = parseFloat(sellingPriceStr.replace(',', '.'));
+    const parsedStock = parseFloat(currentStockStr.replace(',', '.'));
+    const parsedMinStock = parseFloat(minStockStr.replace(',', '.'));
+
+    if (isNaN(parsedCost) || !isFinite(parsedCost) || parsedCost < 0) {
+      setErrorMsg('Preço de custo inválido. Deve ser um número maior ou igual a zero.');
+      return;
+    }
+
+    if (isNaN(parsedSelling) || !isFinite(parsedSelling) || parsedSelling <= 0) {
+      setErrorMsg('Preço de venda inválido. Deve ser um número maior que zero.');
+      return;
+    }
+
+    if (isNaN(parsedStock) || !isFinite(parsedStock)) {
+      setErrorMsg('Estoque atual inválido. Deve ser um número válido.');
+      return;
+    }
+
+    if (isNaN(parsedMinStock) || !isFinite(parsedMinStock) || parsedMinStock < 0) {
+      setErrorMsg('Estoque mínimo inválido. Não pode ser negativo.');
+      return;
+    }
+
+    if (ncm.trim()) {
+      const clean = ncm.trim().replace(/[\.\s]/g, '');
+      if (!/^\d{2,8}$/.test(clean)) {
+        setErrorMsg('NCM inválido. Deve conter entre 2 e 8 dígitos numéricos.');
+        return;
+      }
     }
 
     setIsSaving(true);
@@ -153,10 +184,10 @@ export const ProductFormModal: React.FC<ProductFormModalProps> = ({
         tenantId,
         name: trimmedName,
         barcode: trimmedBarcode,
-        costPrice,
-        sellingPrice,
-        currentStock,
-        minStock,
+        costPrice: parsedCost,
+        sellingPrice: parsedSelling,
+        currentStock: parsedStock,
+        minStock: parsedMinStock,
         unit,
         category: category.trim() || 'Geral',
         ncm: ncm.trim() || undefined,

@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { localDb, LocalDatabase } from './apps/desktop/src/db/local-db';
-import { NodeSqliteDriver, TauriSqliteDriver } from './apps/desktop/src/db/sqlite-driver';
+import { localDb, LocalDatabase, ValidationError } from './apps/desktop/src/db/local-db';
+import { NodeSqliteDriver, TauriSqliteDriver, BrowserSqliteDriver, ISqliteStorageAdapter } from './apps/desktop/src/db/sqlite-driver';
+import { runMigrations } from './apps/desktop/src/db/schema';
 import { ThermalPrinterService } from './apps/desktop/src/services/printer-usb';
 import { SaleWriterService } from './apps/desktop/src/services/sale-writer';
 import { SyncWorkerClient } from './apps/desktop/src/services/sync-worker-client';
-import { CloudApiClient } from './apps/desktop/src/services/cloud-api-client';
+import { CloudApiClient, CloudResponseError } from './apps/desktop/src/services/cloud-api-client';
 import { exportProductsToExcelBuffer } from './functions/src/exporters/excel-exporter';
 import {
   extractProductsFromExcel,
@@ -19,15 +20,16 @@ import {
   CloudSaleHandler,
   FirestoreTransactionContext,
   validateSalePayload,
+  computeCanonicalSaleHash,
 } from './functions/src/cloud-sale-handler';
 import { executeNightGraph } from './functions/src/ai-graph/night-graph';
 import { Product, Sale, Tenant, TenantSettings, CashSession, StockMovement } from './packages/shared/src';
-import { assertTenantAdmin } from './functions/src/endpoints/auth-claims-endpoint';
+import { assertTenantAdmin, assignUserClaims } from './functions/src/endpoints/auth-claims-endpoint';
 import { AuthenticatedUserContext, verifyAuthToken } from './functions/src/endpoints/sale-endpoint';
 
 async function runRigorousVerification() {
   console.log('================================================================');
-  console.log('🧪 BATERIA DE TESTES E AUDITORIA ARQUITETURAL (15 ETAPAS)');
+  console.log('🧪 BATERIA DE TESTES E AUDITORIA ARQUITETURAL (16 ETAPAS)');
   console.log('================================================================\n');
 
   const tenantId = 'tenant_audit_001';
@@ -2001,6 +2003,513 @@ async function runRigorousVerification() {
   );
   console.log('  ✓ Funções de backend validam autorização independentemente das Rules.');
   console.log('  ✓ Critérios de aceite da Task 6 plenamente comprovados.\n');
+
+  // -------------------------------------------------------------------------
+  // ETAPA 16: Task 6.5 — Estabilização do Módulo de Produtos e Auditoria
+  // -------------------------------------------------------------------------
+  console.log('▶ TESTE 16: Task 6.5 — Estabilização do Módulo de Produtos e Auditoria');
+
+  // 1. BrowserSqliteDriver: Snapshots pós-commit, rollback safety e tolerância a corrupção
+  console.log('  [16.1] Testando BrowserSqliteDriver: snapshots pós-commit, rollback safety e corrupção...');
+  let savedSnapshots: Uint8Array[] = [];
+  const mockStorage: ISqliteStorageAdapter = {
+    async loadSnapshot(): Promise<Uint8Array | null> {
+      return savedSnapshots.length > 0 ? savedSnapshots[savedSnapshots.length - 1] : null;
+    },
+    async saveSnapshot(data: Uint8Array): Promise<void> {
+      savedSnapshots.push(new Uint8Array(data));
+    },
+    async clear(): Promise<void> {
+      savedSnapshots = [];
+    },
+  };
+
+  const browserDriver = new BrowserSqliteDriver({ storageAdapter: mockStorage });
+  await browserDriver.init();
+  await runMigrations(browserDriver);
+  assert.ok(savedSnapshots.length > 0, 'Snapshot deve ser salvo no storage após migrações DDL comitadas.');
+
+  const snapshotsBeforeRollback = savedSnapshots.length;
+  await assert.rejects(async () => {
+    await browserDriver.transaction(async (tx) => {
+      await tx.execute("INSERT INTO sync_metadata (key, value, updated_at) VALUES ('test_rollback', 'val', 123);");
+      throw new Error('SIMULATED_TRANSACTION_FAILURE');
+    });
+  });
+  assert.strictEqual(savedSnapshots.length, snapshotsBeforeRollback, 'Nenhum snapshot deve ser persistido em caso de ROLLBACK.');
+
+  const exportedBytes = await browserDriver.exportDatabase();
+  assert.ok(exportedBytes instanceof Uint8Array && exportedBytes.length > 0, 'exportDatabase deve retornar Uint8Array com o banco binário.');
+
+  // Teste de importação de banco
+  const browserDriverImport = new BrowserSqliteDriver({ storageAdapter: mockStorage });
+  await browserDriverImport.init();
+  await browserDriverImport.importDatabase(exportedBytes);
+  const importedRows = await browserDriverImport.query<{ value: string }>("SELECT value FROM sync_metadata WHERE key = 'lastSyncAt';");
+  assert.ok(Array.isArray(importedRows), 'Importação de banco deve restaurar estado consultável.');
+
+  // Teste de recuperação de dados corrompidos
+  const corruptStorage: ISqliteStorageAdapter = {
+    async loadSnapshot() {
+      return new Uint8Array([0x00, 0x01, 0x02, 0x03, 0xff, 0xfe]); // bytes corrompidos
+    },
+    async saveSnapshot() {},
+    async clear() {},
+  };
+  const corruptBrowserDriver = new BrowserSqliteDriver({ storageAdapter: corruptStorage });
+  await corruptBrowserDriver.init();
+  assert.strictEqual(corruptBrowserDriver.isInitialized(), true, 'Driver deve inicializar com banco limpo caso snapshot esteja corrompido.');
+  await browserDriver.close();
+  await browserDriverImport.close();
+  await corruptBrowserDriver.close();
+  console.log('  ✓ BrowserSqliteDriver: snapshots garantidos pós-commit, rollback seguro e tolerância a corrupção.');
+
+  // 2. Isolamento estrito de tenant no LocalDatabase
+  console.log('  [16.2] Testando isolamento estrito de tenant no LocalDatabase...');
+  const tenantA = 'tenant_t16_alpha';
+  const tenantB = 'tenant_t16_beta';
+
+  localDb.setActiveTenantId(tenantA);
+  const productA = await localDb.saveProduct(
+    {
+      tenantId: tenantA,
+      name: 'Produto Alpha Exclusivo',
+      barcode: '7897770001001',
+      costPrice: 10,
+      sellingPrice: 20,
+      minStock: 5,
+      currentStock: 50,
+      unit: 'UN',
+      category: 'AlphaCat',
+      ncm: '09012100',
+    },
+    tenantA
+  );
+
+  localDb.setActiveTenantId(tenantB);
+  const productB = await localDb.saveProduct(
+    {
+      tenantId: tenantB,
+      name: 'Produto Beta Exclusivo',
+      barcode: '7897770002002',
+      costPrice: 15,
+      sellingPrice: 30,
+      minStock: 2,
+      currentStock: 20,
+      unit: 'CX',
+      category: 'BetaCat',
+      ncm: '10063021',
+    },
+    tenantB
+  );
+
+  // Leitura via getAllProducts com tenant estrito
+  const productsA = await localDb.getAllProducts(true, tenantA);
+  const productsB = await localDb.getAllProducts(true, tenantB);
+  assert.ok(productsA.some((p) => p.id === productA.id), 'Produtos de A devem conter productA.');
+  assert.ok(!productsA.some((p) => p.id === productB.id), 'Produtos de A NÃO podem conter productB.');
+  assert.ok(productsB.some((p) => p.id === productB.id), 'Produtos de B devem conter productB.');
+  assert.ok(!productsB.some((p) => p.id === productA.id), 'Produtos de B NÃO podem conter productA.');
+
+  // Busca e cache isolados por tenant
+  localDb.setActiveTenantId(tenantA);
+  assert.strictEqual(localDb.findByBarcode(productA.barcode)?.id, productA.id);
+  assert.strictEqual(localDb.findByBarcode(productB.barcode), undefined, 'Tenant A não pode localizar barcode de Tenant B.');
+
+  localDb.setActiveTenantId(tenantB);
+  assert.strictEqual(localDb.findByBarcode(productB.barcode)?.id, productB.id);
+  assert.strictEqual(localDb.findByBarcode(productA.barcode), undefined, 'Tenant B não pode localizar barcode de Tenant A.');
+
+  // Rejeição de delta update com tenant divergente
+  await assert.rejects(
+    async () => {
+      await localDb.upsertDeltaProducts([productB], Date.now(), tenantA);
+    },
+    (err: any) => err instanceof ValidationError && err.field === 'tenantId'
+  );
+  console.log('  ✓ Isolamento estrito de tenant: leituras, buscas, cache e deltas filtrados sem vazamento.');
+
+  // 3. Persistência de NCM no SQLite e no domínio
+  console.log('  [16.3] Testando persistência e validação de NCM no SQLite e no domínio...');
+  localDb.setActiveTenantId(tenantA);
+  const prodNcm = await localDb.saveProduct(
+    {
+      tenantId: tenantA,
+      name: 'Café Especial com NCM Formatado',
+      barcode: '7897770003003',
+      costPrice: 8,
+      sellingPrice: 16,
+      minStock: 4,
+      currentStock: 25,
+      unit: 'UN',
+      ncm: '0901.21.00', // Pontuação deve ser limpa
+    },
+    tenantA
+  );
+  assert.strictEqual(prodNcm.ncm, '09012100', 'NCM deve ser salvo limpo (apenas dígitos).');
+
+  const fetchedProdNcm = localDb.findById(prodNcm.id, tenantA);
+  assert.strictEqual(fetchedProdNcm?.ncm, '09012100', 'NCM deve ser recuperado corretamente do cache/banco.');
+
+  // Rejeição de NCM com letras ou tamanho inválido
+  await assert.rejects(
+    async () => {
+      await localDb.saveProduct(
+        {
+          tenantId: tenantA,
+          name: 'NCM com Letras Inválido',
+          barcode: '7897770003004',
+          costPrice: 5,
+          sellingPrice: 10,
+          minStock: 1,
+          currentStock: 10,
+          unit: 'UN',
+          ncm: 'NCM12345',
+        },
+        tenantA
+      );
+    },
+    (err: any) => err instanceof ValidationError && err.field === 'ncm'
+  );
+
+  await assert.rejects(
+    async () => {
+      await localDb.saveProduct(
+        {
+          tenantId: tenantA,
+          name: 'NCM Muito Curto',
+          barcode: '7897770003005',
+          costPrice: 5,
+          sellingPrice: 10,
+          minStock: 1,
+          currentStock: 10,
+          unit: 'UN',
+          ncm: '1',
+        },
+        tenantA
+      );
+    },
+    (err: any) => err instanceof ValidationError && err.field === 'ncm'
+  );
+  console.log('  ✓ Persistência de NCM e validação fiscal de 2 a 8 dígitos numéricos comprovadas.');
+
+  // 4. Unicidade de código de barras por tenant
+  console.log('  [16.4] Testando unicidade de código de barras por tenant e colisão inter-tenant...');
+  const sharedBarcode = '7899999000001';
+
+  localDb.setActiveTenantId(tenantA);
+  await localDb.saveProduct(
+    {
+      tenantId: tenantA,
+      name: 'Produto Alpha Barcode Compartilhado',
+      barcode: sharedBarcode,
+      costPrice: 5,
+      sellingPrice: 10,
+      minStock: 1,
+      currentStock: 10,
+      unit: 'UN',
+    },
+    tenantA
+  );
+
+  // Salvar outro produto com mesmo barcode no mesmo tenant A deve falhar
+  await assert.rejects(
+    async () => {
+      await localDb.saveProduct(
+        {
+          tenantId: tenantA,
+          name: 'Produto Alpha Duplicado',
+          barcode: sharedBarcode,
+          costPrice: 5,
+          sellingPrice: 10,
+          minStock: 1,
+          currentStock: 10,
+          unit: 'UN',
+        },
+        tenantA
+      );
+    },
+    (err: any) => err.message.includes('já está em uso')
+  );
+
+  // Salvar no tenant B com o MESMO barcode deve ser permitido (isolamento multi-tenant)
+  localDb.setActiveTenantId(tenantB);
+  const prodTenantB = await localDb.saveProduct(
+    {
+      tenantId: tenantB,
+      name: 'Produto Beta Barcode Compartilhado',
+      barcode: sharedBarcode,
+      costPrice: 6,
+      sellingPrice: 12,
+      minStock: 2,
+      currentStock: 15,
+      unit: 'UN',
+    },
+    tenantB
+  );
+  assert.ok(prodTenantB.id, 'Mesmo barcode em tenant diferente deve ser aceito.');
+  console.log('  ✓ Unicidade de barcode por tenant garantida; colisão em tenants distintos permitida.');
+
+  // 5. Validação estrita de dados de produtos
+  console.log('  [16.5] Testando rejeição estrita de dados inválidos (nome vazio, caracteres de controle, NaN, negativos)...');
+  localDb.setActiveTenantId(tenantA);
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: '   ', barcode: '111', costPrice: 1, sellingPrice: 2, minStock: 0, currentStock: 0, unit: 'UN' }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'name'
+  );
+
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: 'Prod', barcode: '789\x01\x02', costPrice: 1, sellingPrice: 2, minStock: 0, currentStock: 0, unit: 'UN' }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'barcode'
+  );
+
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: 'Prod', barcode: '111222', costPrice: -10, sellingPrice: 20, minStock: 0, currentStock: 0, unit: 'UN' }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'costPrice'
+  );
+
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: 'Prod', barcode: '111222', costPrice: 10, sellingPrice: 0, minStock: 0, currentStock: 0, unit: 'UN' }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'sellingPrice'
+  );
+
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: 'Prod', barcode: '111222', costPrice: 10, sellingPrice: NaN, minStock: 0, currentStock: 0, unit: 'UN' }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'sellingPrice'
+  );
+
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: 'Prod', barcode: '111222', costPrice: 10, sellingPrice: 20, minStock: -5, currentStock: 0, unit: 'UN' }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'minStock'
+  );
+
+  await assert.rejects(
+    async () => localDb.saveProduct({ tenantId: tenantA, name: 'Prod', barcode: '111222', costPrice: 10, sellingPrice: 20, minStock: 0, currentStock: 0, unit: 'PACOTES' as any }, tenantA),
+    (err: any) => err instanceof ValidationError && err.field === 'unit'
+  );
+  console.log('  ✓ Validação estrita de produto elimina fallbacks silenciosos e rejeita corrupção.');
+
+  // 6. Sincronização de catálogo via outbox e roteamento no SyncWorker
+  console.log('  [16.6] Testando gravação de eventos de catálogo na Outbox e roteamento no SyncWorker...');
+  localDb.setActiveTenantId(tenantA);
+  await localDb.toggleProductStatus(productA.id, tenantA);
+
+  const t16PendingOps = await localDb.getPendingOutboxOperations(100);
+  const catUpsertOp = t16PendingOps.find((op) => op.type === 'CATALOG_PRODUCT_UPSERT' && op.payload.includes(productA.id));
+  const catToggleOp = t16PendingOps.find((op) => op.type === 'CATALOG_PRODUCT_TOGGLE' && op.payload.includes(productA.id));
+
+  assert.ok(catUpsertOp, 'Outbox deve conter evento CATALOG_PRODUCT_UPSERT gravado na mesma transação.');
+  assert.ok(catToggleOp, 'Outbox deve conter evento CATALOG_PRODUCT_TOGGLE gravado na mesma transação.');
+
+  let catalogDispatched = 0;
+  CloudApiClient.setMockCatalogDispatcher(async (payload, type) => {
+    catalogDispatched++;
+    assert.ok(type === 'CATALOG_PRODUCT_UPSERT' || type === 'CATALOG_PRODUCT_TOGGLE');
+    return { success: true, operationId: `mock_${Date.now()}` };
+  });
+
+  const worker = new SyncWorkerClient();
+  await worker.syncOnce(true);
+  assert.ok(catalogDispatched >= 2, 'SyncWorker deve rotear operações de catálogo para o catalogDispatcher.');
+  CloudApiClient.setMockCatalogDispatcher(undefined);
+  console.log('  ✓ Sincronização de catálogo via outbox: eventos transacionais e roteamento correto no worker.');
+
+  // 7. Validação de resposta da nuvem no CloudApiClient
+  console.log('  [16.7] Testando validação de resposta da nuvem no CloudApiClient...');
+  const originalFetch = globalThis.fetch;
+  const sampleSale: Sale = {
+    id: 'sale_mock_val_01',
+    operationId: 'op_mock_val_01',
+    tenantId: tenantA,
+    sessionId: 'sess_1',
+    deviceId: 'dev_1',
+    saleNumber: 101,
+    userId: 'u1',
+    userName: 'Tester',
+    subtotal: 20,
+    discount: 0,
+    total: 20,
+    totalCost: 10,
+    items: [{ productId: 'p1', productName: 'Prod', barcode: '111', quantity: 1, unitPrice: 20, unitCost: 10, totalPrice: 20, totalCost: 10 }],
+    payments: [{ method: 'DINHEIRO', amount: 20, changeAmount: 0 }],
+    status: 'COMPLETED',
+    createdAt: Date.now(),
+  };
+
+  // Simula resposta HTML de proxy (ex: 502)
+  globalThis.fetch = async () => {
+    return new Response('<html><body>502 Bad Gateway</body></html>', {
+      status: 502,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    });
+  };
+  await assert.rejects(
+    async () => CloudApiClient.processSaleTransaction(sampleSale),
+    (err: any) => err instanceof CloudResponseError && err.code === 'INVALID_CONTENT_TYPE'
+  );
+
+  // Simula resposta com success: false
+  globalThis.fetch = async () => {
+    return new Response(JSON.stringify({ success: false, error: 'SALDO_INSUFICIENTE' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  await assert.rejects(
+    async () => CloudApiClient.processSaleTransaction(sampleSale),
+    (err: any) => err.message.includes('SALDO_INSUFICIENTE')
+  );
+
+  // Simula resposta com saleId divergente
+  globalThis.fetch = async () => {
+    return new Response(JSON.stringify({ success: true, saleId: 'sale_divergent_id', operationId: sampleSale.operationId }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+  await assert.rejects(
+    async () => CloudApiClient.processSaleTransaction(sampleSale),
+    (err: any) => err instanceof CloudResponseError && err.code === 'DIVERGENT_SALE_ID'
+  );
+
+  globalThis.fetch = originalFetch;
+  console.log('  ✓ CloudApiClient rejeita HTML, respostas falsas e divergência de IDs com erros tipados.');
+
+  // 8. Contrato de pagamento em dinheiro e troco
+  console.log('  [16.8] Testando contrato financeiro de pagamento em dinheiro e troco...');
+  const cashSale: Sale = {
+    id: `sale_cash_${Date.now()}`,
+    operationId: `op_cash_${Date.now()}`,
+    tenantId: tenantA,
+    sessionId: 'sess_1',
+    deviceId: 'dev_1',
+    saleNumber: 202,
+    userId: 'u1',
+    userName: 'Tester',
+    subtotal: 40,
+    discount: 0,
+    total: 40,
+    totalCost: 20,
+    items: [{ productId: 'p1', productName: 'Prod', barcode: '111', quantity: 2, unitPrice: 20, unitCost: 10, totalPrice: 40, totalCost: 20 }],
+    payments: [{ method: 'DINHEIRO', amount: 50, changeAmount: 10 }], // R$ 50 entregue - R$ 10 troco = R$ 40 aplicado
+    status: 'COMPLETED',
+    createdAt: Date.now(),
+  };
+  assert.doesNotThrow(() => validateSalePayload(cashSale, tenantA), 'Venda em dinheiro com troco deve ser validada com sucesso.');
+
+  // Troco em forma não dinheiro deve ser rejeitado
+  const invalidPixSale: Sale = {
+    ...cashSale,
+    id: `sale_pix_invalid_${Date.now()}`,
+    payments: [{ method: 'PIX', amount: 50, changeAmount: 10 }],
+  };
+  assert.throws(
+    () => validateSalePayload(invalidPixSale, tenantA),
+    (err: any) => err.message.includes('PIX') && err.message.includes('não podem conter troco')
+  );
+  console.log('  ✓ Contrato financeiro: tender vs changeAmount e rejeição de troco para PIX/Cartão comprovados.');
+
+  // 9. Idempotência completa com hash canônico SHA-256
+  console.log('  [16.9] Testando idempotência estrita via hash canônico SHA-256 no backend...');
+  const memoryOperations = new Map<string, any>();
+  const memorySales = new Map<string, Sale>();
+  const memoryProducts = new Map<string, any>([
+    ['p1', { id: 'p1', currentStock: 100 }],
+  ]);
+
+  const mockTxContext: FirestoreTransactionContext = {
+    async getOperation(tId, opId) {
+      return memoryOperations.get(`${tId}:${opId}`) || null;
+    },
+    async getSale(tId, saleId) {
+      return memorySales.get(`${tId}:${saleId}`) || null;
+    },
+    async getProduct(tId, prodId) {
+      return memoryProducts.get(prodId) || null;
+    },
+    async saveSale(tId, s) {
+      memorySales.set(`${tId}:${s.id}`, s);
+    },
+    async updateProductStock(tId, prodId, newStock) {
+      const p = memoryProducts.get(prodId);
+      if (p) p.currentStock = newStock;
+    },
+    async recordStockMovement() {},
+    async saveSignal() {},
+    async recordOperation(tId, opId, data) {
+      memoryOperations.set(`${tId}:${opId}`, data);
+    },
+  };
+
+  const t16InitialStock = memoryProducts.get('p1').currentStock;
+
+  // 1ª Execução: sucesso
+  const res1 = await CloudSaleHandler.processCloudSale(tenantA, cashSale, mockTxContext);
+  assert.strictEqual(res1.success, true);
+  assert.strictEqual(res1.idempotentRepeat, false);
+  assert.strictEqual(memoryProducts.get('p1').currentStock, t16InitialStock - 2);
+
+  // 2ª Execução com conteúdo idêntico: retorno idempotente sem debitar estoque novamente
+  const res2 = await CloudSaleHandler.processCloudSale(tenantA, cashSale, mockTxContext);
+  assert.strictEqual(res2.success, true);
+  assert.strictEqual(res2.idempotentRepeat, true);
+  assert.strictEqual(memoryProducts.get('p1').currentStock, t16InitialStock - 2, 'Estoque não pode sofrer nova baixa em re-execução idempotente.');
+
+  // 3ª Execução com mesmo operationId mas hash comercial divergente: deve rejeitar com INTEGRITY_CONFLICT
+  const t16DivergentSale: Sale = {
+    ...cashSale,
+    items: [{ productId: 'p1', productName: 'Prod Alterado', barcode: '111', quantity: 1, unitPrice: 40, unitCost: 20, totalPrice: 40, totalCost: 20 }],
+  };
+  await assert.rejects(
+    async () => CloudSaleHandler.processCloudSale(tenantA, t16DivergentSale, mockTxContext),
+    (err: any) => err.message.includes('INTEGRITY_CONFLICT') && err.message.includes('hash divergente')
+  );
+
+  // 4ª Execução com novo operationId mas saleId duplicado: deve rejeitar duplicidade de venda
+  const duplicateSaleIdOp: Sale = {
+    ...cashSale,
+    operationId: `op_different_${Date.now()}`,
+  };
+  await assert.rejects(
+    async () => CloudSaleHandler.processCloudSale(tenantA, duplicateSaleIdOp, mockTxContext),
+    (err: any) => err.message.includes('INTEGRITY_CONFLICT') && err.message.includes('já foi gravada sob outra operação')
+  );
+  console.log('  ✓ Idempotência completa com hash canônico e proteção contra duplicação de saleId validadas.');
+
+  // 10. Atribuição de permissões (assignUserClaims)
+  console.log('  [16.10] Testando validação de atribuição de permissões (assignUserClaims)...');
+  const adminCaller: AuthenticatedUserContext = { uid: 'admin_user_1', tenantId: tenantA, role: 'ADMIN' };
+
+  // Tentativa de auto-elevação
+  await assert.rejects(
+    async () => assignUserClaims(adminCaller, 'admin_user_1', tenantA, 'ADMIN'),
+    (err: any) => err.message.includes('PERMISSION_DENIED') && err.message.includes('Auto-elevação')
+  );
+  console.log('  ✓ Atribuição de permissões impede auto-elevação e exige autorização estrita de admin.');
+
+  // 11. Exclusividade de transação SQLite
+  console.log('  [16.11] Testando exclusividade de transação SQLite e isolamento via AsyncMutex...');
+  const testDriver = new NodeSqliteDriver(':memory:');
+  await testDriver.init();
+  await testDriver.execute('CREATE TABLE tx_test (id INT, val TEXT);');
+
+  let txCompleted = false;
+  const txPromise = testDriver.transaction(async (tx) => {
+    await tx.execute('INSERT INTO tx_test VALUES (?, ?);', [1, 'a']);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await tx.execute('INSERT INTO tx_test VALUES (?, ?);', [2, 'b']);
+    txCompleted = true;
+  });
+
+  const queryPromise = testDriver.query('SELECT COUNT(*) as count FROM tx_test;');
+  const [_, queryRows] = await Promise.all([txPromise, queryPromise]);
+
+  assert.strictEqual(txCompleted, true, 'Transação deve estar completa.');
+  assert.strictEqual((queryRows[0] as any).count, 2, 'Query direta deve aguardar a transação aberta e ver os 2 registros comitados.');
+  await testDriver.close();
+  localDb.setActiveTenantId(tenantId);
+  console.log('  ✓ Exclusividade de transação SQLite garantida sem colisões ou deadlocks.');
+  console.log('  ✓ Critérios de aceite da Task 6.5 plenamente comprovados com excelência.\n');
 }
 
 runRigorousVerification().catch((err) => {

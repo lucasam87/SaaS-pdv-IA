@@ -103,6 +103,15 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Indicador de Sincronização e Conexão Real */}
         <div className="flex items-center gap-2.5 bg-slate-800/80 px-3 py-1.5 rounded-lg border border-slate-700/60 text-xs">
+          {typeof window !== 'undefined' && !('__TAURI_INTERNALS__' in window) && (
+            <span
+              title="Executando em modo Navegador com persistência IndexedDB garantida pós-commit"
+              className="text-[10px] bg-sky-500/10 text-sky-400 border border-sky-500/20 px-1.5 py-0.5 rounded font-mono font-bold"
+            >
+              Web / IndexedDB
+            </span>
+          )}
+
           {isOnline ? (
             <span className="flex items-center gap-1.5 text-emerald-400 font-medium">
               <Wifi className="w-3.5 h-3.5" /> Rede Ativa
@@ -116,7 +125,7 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Contagem Real de Sincronizadas / Confirmadas */}
           {syncedCount > 0 && (
             <span
-              title="Vendas confirmadas e sincronizadas com a nuvem"
+              title="Operações de vendas e catálogo sincronizadas na nuvem"
               className="flex items-center gap-1 text-emerald-400/90 font-mono text-[11px] bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20"
             >
               <CheckCircle2 className="w-3 h-3 text-emerald-400" />
@@ -127,7 +136,7 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Contagem Real de Falhas */}
           {failedCount > 0 && (
             <span
-              title="Operações que falharam na sincronização remota"
+              title="Operações de vendas ou catálogo que falharam na sincronização remota"
               className="flex items-center gap-1 text-rose-400 font-mono text-[11px] bg-rose-500/10 px-2 py-0.5 rounded border border-rose-500/20"
             >
               <AlertCircle className="w-3 h-3 text-rose-400" />
@@ -139,7 +148,7 @@ export const Header: React.FC<HeaderProps> = ({
           {pendingCount > 0 ? (
             <button
               onClick={onSyncNow}
-              title="Vendas aguardando integração ou confirmação do backend"
+              title="Operações de vendas e catálogo na Outbox aguardando confirmação da nuvem"
               className="flex items-center gap-1 bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded font-mono text-[11px] border border-amber-500/30 hover:bg-amber-500/30 transition-all"
             >
               <RefreshCw className="w-3 h-3" />

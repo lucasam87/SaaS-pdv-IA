@@ -52,8 +52,8 @@ export const ProductsView: React.FC<ProductsViewProps> = ({
     try {
       setIsLoading(true);
       const [prods, cats] = await Promise.all([
-        localDb.getAllProducts(true),
-        localDb.getCategories(),
+        localDb.getAllProducts(true, tenantId),
+        localDb.getCategories(tenantId),
       ]);
       setProducts(prods);
       setCategories(cats);
@@ -63,7 +63,7 @@ export const ProductsView: React.FC<ProductsViewProps> = ({
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [tenantId]);
 
   useEffect(() => {
     loadData();
@@ -120,7 +120,7 @@ export const ProductsView: React.FC<ProductsViewProps> = ({
 
   const handleSaveProduct = async (productData: ProductFormInput) => {
     const isNew = !productData.id;
-    await localDb.saveProduct(productData);
+    await localDb.saveProduct(productData, tenantId);
     await loadData();
     onShowToast(
       isNew
@@ -131,7 +131,7 @@ export const ProductsView: React.FC<ProductsViewProps> = ({
 
   const handleToggleStatus = async (product: Product) => {
     try {
-      const newStatus = await localDb.toggleProductStatus(product.id);
+      const newStatus = await localDb.toggleProductStatus(product.id, tenantId);
       await loadData();
       onShowToast(
         newStatus

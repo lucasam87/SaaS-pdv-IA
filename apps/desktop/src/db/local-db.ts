@@ -25,18 +25,37 @@ export interface OutboxRecord {
   updatedAt: number;
 }
 
+export class ValidationError extends Error {
+  public field: string;
+  constructor(field: string, message: string) {
+    super(`[ValidationError] ${field}: ${message}`);
+    this.name = 'ValidationError';
+    this.field = field;
+  }
+}
+
 export class LocalDatabase {
   private driver: ISqliteDriver;
   private initialized: boolean = false;
   private initPromise: Promise<void> | null = null;
+  private activeTenantId: string | null = null;
 
   // Cache em memória para busca instantânea de produtos (< 1ms para leitor de código de barras)
+  // Isolado por chave composta: `${tenantId}:${barcode}` e `${tenantId}:${id}`
   private productsByBarcode: Map<string, Product> = new Map();
   private productsById: Map<string, Product> = new Map();
   private productsList: Product[] = [];
 
   constructor(driver?: ISqliteDriver) {
     this.driver = driver || createSqliteDriver();
+  }
+
+  public setActiveTenantId(tenantId: string | null): void {
+    this.activeTenantId = tenantId ? tenantId.trim() : null;
+  }
+
+  public getActiveTenantId(): string | null {
+    return this.activeTenantId;
   }
 
   /**
@@ -74,8 +93,12 @@ export class LocalDatabase {
     }
   }
 
-  public async loadProductsIntoCache(): Promise<void> {
+  public async loadProductsIntoCache(tenantId?: string): Promise<void> {
     try {
+      if (tenantId) {
+        this.activeTenantId = tenantId.trim();
+      }
+
       const rows = await this.driver.query<Record<string, unknown>>(
         'SELECT * FROM local_products WHERE is_active = 1;'
       );
@@ -86,10 +109,8 @@ export class LocalDatabase {
     }
   }
 
-  private populateCacheFromRows(rows: Record<string, unknown>[]) {
-    this.productsByBarcode.clear();
-    this.productsById.clear();
-    this.productsList = rows.map((r) => ({
+  private mapProductRow(r: Record<string, unknown>): Product {
+    return {
       id: String(r.id),
       tenantId: String(r.tenant_id),
       name: String(r.name),
@@ -100,35 +121,56 @@ export class LocalDatabase {
       currentStock: Number(r.current_stock),
       unit: (r.unit as ProductUnit) || 'UN',
       category: (r.category as string) || 'Geral',
+      ncm: r.ncm ? String(r.ncm) : undefined,
       isActive: Boolean(r.is_active),
       createdAt: Number(r.updated_at),
       updatedAt: Number(r.updated_at),
-    }));
+    };
+  }
+
+  private populateCacheFromRows(rows: Record<string, unknown>[]) {
+    this.productsByBarcode.clear();
+    this.productsById.clear();
+    this.productsList = rows.map((r) => this.mapProductRow(r));
+
+    const distinctTenants = new Set(this.productsList.map((p) => p.tenantId));
+    if (!this.activeTenantId && distinctTenants.size === 1) {
+      this.activeTenantId = distinctTenants.values().next().value ?? null;
+    }
 
     for (const p of this.productsList) {
-      this.productsById.set(p.id, p);
+      const tenantKey = p.tenantId.trim();
+      this.productsById.set(`${tenantKey}:${p.id}`, p);
       if (p.barcode) {
-        this.productsByBarcode.set(p.barcode.trim(), p);
+        this.productsByBarcode.set(`${tenantKey}:${p.barcode.trim()}`, p);
       }
     }
   }
 
   // --- Buscas Síncronas Instantâneas no Cache (< 1ms) ---
 
-  public findByBarcode(barcode: string): Product | undefined {
-    return this.productsByBarcode.get(barcode.trim());
+  public findByBarcode(barcode: string, tenantId?: string): Product | undefined {
+    const targetTenant = tenantId || this.activeTenantId;
+    if (!targetTenant) return undefined;
+    return this.productsByBarcode.get(`${targetTenant}:${barcode.trim()}`);
   }
 
-  public findById(id: string): Product | undefined {
-    return this.productsById.get(id);
+  public findById(id: string, tenantId?: string): Product | undefined {
+    const targetTenant = tenantId || this.activeTenantId;
+    if (!targetTenant) return undefined;
+    return this.productsById.get(`${targetTenant}:${id}`);
   }
 
-  public search(query: string, limit: number = 20): Product[] {
+  public search(query: string, limit: number = 20, tenantId?: string): Product[] {
+    const targetTenant = tenantId || this.activeTenantId;
+    if (!targetTenant) return [];
+
     const q = query.toLowerCase().trim();
     if (!q) return [];
 
     const results: Product[] = [];
     for (const p of this.productsList) {
+      if (p.tenantId !== targetTenant) continue;
       if (p.name.toLowerCase().includes(q) || p.barcode.includes(q)) {
         results.push(p);
         if (results.length >= limit) break;
@@ -142,16 +184,20 @@ export class LocalDatabase {
   /**
    * Atualiza produtos no SQLite e atualiza o cache em memória atomicamente.
    */
-  public async upsertDeltaProducts(incomingProducts: Product[], syncTimestamp: number): Promise<void> {
+  public async upsertDeltaProducts(incomingProducts: Product[], syncTimestamp: number, tenantId?: string): Promise<void> {
     await this.ensureReady();
+    const targetTenant = tenantId || this.activeTenantId;
 
     await this.driver.transaction(async (tx) => {
       for (const p of incomingProducts) {
+        if (targetTenant && p.tenantId && p.tenantId !== targetTenant) {
+          throw new ValidationError('tenantId', `Produto "${p.name}" possui tenantId (${p.tenantId}) divergente do contexto (${targetTenant}).`);
+        }
         await tx.execute(
           `INSERT INTO local_products (
             id, tenant_id, name, barcode, cost_price, selling_price,
-            min_stock, current_stock, unit, category, is_active, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            min_stock, current_stock, unit, category, ncm, is_active, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             barcode = excluded.barcode,
@@ -161,6 +207,7 @@ export class LocalDatabase {
             current_stock = excluded.current_stock,
             unit = excluded.unit,
             category = excluded.category,
+            ncm = excluded.ncm,
             is_active = excluded.is_active,
             updated_at = excluded.updated_at;`,
           [
@@ -174,6 +221,7 @@ export class LocalDatabase {
             p.currentStock,
             p.unit || 'UN',
             p.category || 'Geral',
+            p.ncm || null,
             p.isActive ? 1 : 0,
             syncTimestamp,
           ]
@@ -187,136 +235,245 @@ export class LocalDatabase {
       );
     });
 
-    await this.loadProductsIntoCache();
+    await this.loadProductsIntoCache(targetTenant || undefined);
   }
 
   /**
-   * Retorna todos os produtos do SQLite, com opção de incluir inativos.
+   * Retorna todos os produtos do SQLite, com opção de incluir inativos para o tenant ativo.
    */
-  public async getAllProducts(includeInactive: boolean = false): Promise<Product[]> {
+  public async getAllProducts(includeInactive: boolean = false, tenantId?: string): Promise<Product[]> {
     await this.ensureReady();
+    const targetTenant = tenantId || this.activeTenantId;
+    if (!targetTenant) {
+      throw new Error('[LocalDB] tenantId is required to query products');
+    }
     const sql = includeInactive
-      ? 'SELECT * FROM local_products ORDER BY name ASC;'
-      : 'SELECT * FROM local_products WHERE is_active = 1 ORDER BY name ASC;';
-    const rows = await this.driver.query<Record<string, unknown>>(sql);
-    return rows.map((r) => ({
-      id: String(r.id),
-      tenantId: String(r.tenant_id),
-      name: String(r.name),
-      barcode: String(r.barcode),
-      costPrice: Number(r.cost_price),
-      sellingPrice: Number(r.selling_price),
-      minStock: Number(r.min_stock),
-      currentStock: Number(r.current_stock),
-      unit: (r.unit as ProductUnit) || 'UN',
-      category: (r.category as string) || 'Geral',
-      isActive: Boolean(r.is_active),
-      createdAt: Number(r.updated_at),
-      updatedAt: Number(r.updated_at),
-    }));
+      ? 'SELECT * FROM local_products WHERE tenant_id = ? ORDER BY name ASC;'
+      : 'SELECT * FROM local_products WHERE is_active = 1 AND tenant_id = ? ORDER BY name ASC;';
+    const rows = await this.driver.query<Record<string, unknown>>(sql, [targetTenant]);
+    return rows.map((r) => this.mapProductRow(r));
   }
 
   /**
-   * Salva ou atualiza um produto no SQLite e sincroniza o cache em memória do PDV.
+   * Salva ou atualiza um produto no SQLite com validação estrita, garantia de unicidade de barcode por tenant,
+   * gravação de evento transacional na outbox e atualização imediata do cache em memória.
    */
   public async saveProduct(
-    input: Omit<Product, 'id' | 'createdAt' | 'updatedAt'> & { id?: string; createdAt?: number; updatedAt?: number }
+    input: Omit<Product, 'id' | 'createdAt' | 'updatedAt'> & { id?: string; createdAt?: number; updatedAt?: number },
+    tenantId?: string
   ): Promise<Product> {
     await this.ensureReady();
+
+    // 1. Validação estrita de Tenant
+    const targetTenant = input.tenantId?.trim() || tenantId || this.activeTenantId;
+    if (!targetTenant) {
+      throw new ValidationError('tenantId', 'Tenant ID é obrigatório.');
+    }
+    if (this.activeTenantId && targetTenant !== this.activeTenantId) {
+      throw new ValidationError('tenantId', `Tenant ID (${targetTenant}) diverge do contexto ativo (${this.activeTenantId}).`);
+    }
+
+    // 2. Validação estrita de Nome
+    const name = input.name ? input.name.trim() : '';
+    if (!name) {
+      throw new ValidationError('name', 'Nome do produto é obrigatório e não pode ser vazio.');
+    }
+
+    // 3. Validação estrita de Código de Barras
+    const barcode = input.barcode ? input.barcode.trim() : '';
+    if (!barcode) {
+      throw new ValidationError('barcode', 'Código de barras é obrigatório e não pode ser vazio.');
+    }
+    if (/[\x00-\x1F\x7F]/.test(barcode)) {
+      throw new ValidationError('barcode', 'Código de barras contém caracteres de controle não imprimíveis inválidos.');
+    }
+
+    // 4. Validação estrita de Preço de Custo
+    if (typeof input.costPrice !== 'number' || isNaN(input.costPrice) || !isFinite(input.costPrice) || input.costPrice < 0) {
+      throw new ValidationError('costPrice', `Preço de custo inválido (${input.costPrice}). Deve ser um número maior ou igual a zero.`);
+    }
+
+    // 5. Validação estrita de Preço de Venda
+    if (typeof input.sellingPrice !== 'number' || isNaN(input.sellingPrice) || !isFinite(input.sellingPrice) || input.sellingPrice <= 0) {
+      throw new ValidationError('sellingPrice', `Preço de venda inválido (${input.sellingPrice}). Deve ser um número estritamente maior que zero.`);
+    }
+
+    // 6. Validação estrita de Estoques
+    if (typeof input.minStock !== 'number' || isNaN(input.minStock) || !isFinite(input.minStock) || input.minStock < 0) {
+      throw new ValidationError('minStock', `Estoque mínimo inválido (${input.minStock}). Não pode ser negativo.`);
+    }
+    if (typeof input.currentStock !== 'number' || isNaN(input.currentStock) || !isFinite(input.currentStock)) {
+      throw new ValidationError('currentStock', `Estoque atual inválido (${input.currentStock}). Deve ser um número finito.`);
+    }
+
+    // 7. Validação estrita de Unidade
+    const validUnits: ProductUnit[] = ['UN', 'KG', 'CX', 'PCT', 'L', 'M'];
+    const unit = input.unit as ProductUnit;
+    if (!unit || !validUnits.includes(unit)) {
+      throw new ValidationError('unit', `Unidade "${unit}" inválida. Permitidas: ${validUnits.join(', ')}.`);
+    }
+
+    // 8. Validação estrita de NCM (opcional, mas se informado deve ter entre 2 e 8 dígitos numéricos)
+    let cleanNcm: string | undefined = undefined;
+    if (input.ncm !== undefined && input.ncm !== null && String(input.ncm).trim() !== '') {
+      const stripped = String(input.ncm).replace(/[\.\s]/g, '');
+      if (!/^\d{2,8}$/.test(stripped)) {
+        throw new ValidationError('ncm', `NCM "${input.ncm}" inválido. Deve conter entre 2 e 8 dígitos numéricos.`);
+      }
+      cleanNcm = stripped;
+    }
+
     const now = Date.now();
     const id = input.id || `prod_${now}_${Math.floor(Math.random() * 1000)}`;
-    const barcode = input.barcode.trim();
-
-    // Valida unicidade de código de barras entre produtos ativos
-    const existingBarcode = await this.driver.query<{ id: string; name: string }>(
-      'SELECT id, name FROM local_products WHERE barcode = ? AND id != ? AND is_active = 1;',
-      [barcode, id]
-    );
-    if (existingBarcode.length > 0) {
-      throw new Error(`Código de barras "${barcode}" já está em uso pelo produto "${existingBarcode[0].name}".`);
-    }
 
     const product: Product = {
       id,
-      tenantId: input.tenantId,
-      name: input.name.trim(),
+      tenantId: targetTenant,
+      name,
       barcode,
-      costPrice: Number(input.costPrice),
-      sellingPrice: Number(input.sellingPrice),
-      minStock: Number(input.minStock),
-      currentStock: Number(input.currentStock),
-      unit: input.unit || 'UN',
+      costPrice: input.costPrice,
+      sellingPrice: input.sellingPrice,
+      minStock: input.minStock,
+      currentStock: input.currentStock,
+      unit,
       category: input.category?.trim() || 'Geral',
+      ncm: cleanNcm,
       isActive: input.isActive !== false,
       createdAt: input.createdAt || now,
       updatedAt: now,
     };
 
-    await this.driver.execute(
-      `INSERT INTO local_products (
-        id, tenant_id, name, barcode, cost_price, selling_price,
-        min_stock, current_stock, unit, category, is_active, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        barcode = excluded.barcode,
-        cost_price = excluded.cost_price,
-        selling_price = excluded.selling_price,
-        min_stock = excluded.min_stock,
-        current_stock = excluded.current_stock,
-        unit = excluded.unit,
-        category = excluded.category,
-        is_active = excluded.is_active,
-        updated_at = excluded.updated_at;`,
-      [
-        product.id,
-        product.tenantId,
-        product.name,
-        product.barcode,
-        product.costPrice,
-        product.sellingPrice,
-        product.minStock,
-        product.currentStock,
-        product.unit,
-        product.category,
-        product.isActive ? 1 : 0,
-        now,
-      ]
-    );
+    // Executa em transação atômica para evitar race conditions em validação concorrente de barcode
+    await this.driver.transaction(async (tx) => {
+      const existingBarcode = await tx.query<{ id: string; name: string }>(
+        'SELECT id, name FROM local_products WHERE barcode = ? AND tenant_id = ? AND id != ? AND is_active = 1;',
+        [barcode, targetTenant, id]
+      );
+      if (existingBarcode.length > 0) {
+        throw new Error(`Código de barras "${barcode}" já está em uso pelo produto "${existingBarcode[0].name}" no tenant "${targetTenant}".`);
+      }
 
-    // Atualiza imediatamente o cache de leitor e catálogo em memória
-    await this.loadProductsIntoCache();
+      await tx.execute(
+        `INSERT INTO local_products (
+          id, tenant_id, name, barcode, cost_price, selling_price,
+          min_stock, current_stock, unit, category, ncm, is_active, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          barcode = excluded.barcode,
+          cost_price = excluded.cost_price,
+          selling_price = excluded.selling_price,
+          min_stock = excluded.min_stock,
+          current_stock = excluded.current_stock,
+          unit = excluded.unit,
+          category = excluded.category,
+          ncm = excluded.ncm,
+          is_active = excluded.is_active,
+          updated_at = excluded.updated_at;`,
+        [
+          product.id,
+          product.tenantId,
+          product.name,
+          product.barcode,
+          product.costPrice,
+          product.sellingPrice,
+          product.minStock,
+          product.currentStock,
+          product.unit,
+          product.category,
+          product.ncm || null,
+          product.isActive ? 1 : 0,
+          now,
+        ]
+      );
+
+      // Enfileira evento de catálogo na Outbox transacionalmente
+      const operationId = `op_cat_upsert_${product.id}_${now}`;
+      const outboxId = `outbox_${operationId}`;
+      await tx.execute(
+        `INSERT INTO outbox_operations (
+          id, tenant_id, type, operation_id, payload, status, attempts, next_attempt_at, processing_deadline, created_at, updated_at
+        ) VALUES (?, ?, 'CATALOG_PRODUCT_UPSERT', ?, ?, 'PENDING', 0, 0, 0, ?, ?);`,
+        [
+          outboxId,
+          product.tenantId,
+          operationId,
+          JSON.stringify(product),
+          now,
+          now,
+        ]
+      );
+    });
+
+    // Atualiza imediatamente o cache em memória do tenant ativo
+    await this.loadProductsIntoCache(targetTenant);
     return product;
   }
 
   /**
-   * Ativa ou desativa um produto no banco e reflete no cache.
+   * Ativa ou desativa um produto no banco, registra evento na outbox e reflete no cache.
    */
-  public async toggleProductStatus(productId: string): Promise<boolean> {
+  public async toggleProductStatus(productId: string, tenantId?: string): Promise<boolean> {
     await this.ensureReady();
-    const rows = await this.driver.query<{ is_active: number }>(
-      'SELECT is_active FROM local_products WHERE id = ?;',
-      [productId]
-    );
-    if (rows.length === 0) {
-      throw new Error(`Produto "${productId}" não encontrado.`);
+    const targetTenant = tenantId || this.activeTenantId;
+    if (!targetTenant) {
+      throw new Error('[LocalDB] tenantId is required to toggle product status');
     }
-    const newStatus = rows[0].is_active === 1 ? 0 : 1;
-    await this.driver.execute(
-      'UPDATE local_products SET is_active = ?, updated_at = ? WHERE id = ?;',
-      [newStatus, Date.now(), productId]
-    );
-    await this.loadProductsIntoCache();
-    return newStatus === 1;
+
+    const now = Date.now();
+    return await this.driver.transaction(async (tx) => {
+      const rows = await tx.query<{ is_active: number }>(
+        'SELECT is_active FROM local_products WHERE id = ? AND tenant_id = ?;',
+        [productId, targetTenant]
+      );
+      if (rows.length === 0) {
+        throw new Error(`Produto "${productId}" não encontrado para o tenant "${targetTenant}".`);
+      }
+      const newStatus = rows[0].is_active === 1 ? 0 : 1;
+      await tx.execute(
+        'UPDATE local_products SET is_active = ?, updated_at = ? WHERE id = ? AND tenant_id = ?;',
+        [newStatus, now, productId, targetTenant]
+      );
+
+      const operationId = `op_cat_toggle_${productId}_${now}`;
+      const outboxId = `outbox_${operationId}`;
+      const togglePayload = {
+        id: productId,
+        tenantId: targetTenant,
+        isActive: newStatus === 1,
+        updatedAt: now,
+      };
+
+      await tx.execute(
+        `INSERT INTO outbox_operations (
+          id, tenant_id, type, operation_id, payload, status, attempts, next_attempt_at, processing_deadline, created_at, updated_at
+        ) VALUES (?, ?, 'CATALOG_PRODUCT_TOGGLE', ?, ?, 'PENDING', 0, 0, 0, ?, ?);`,
+        [
+          outboxId,
+          targetTenant,
+          operationId,
+          JSON.stringify(togglePayload),
+          now,
+          now,
+        ]
+      );
+
+      return newStatus === 1;
+    });
   }
 
   /**
-   * Retorna lista de categorias distintas existentes na loja.
+   * Retorna lista de categorias distintas existentes na loja para o tenant.
    */
-  public async getCategories(): Promise<string[]> {
+  public async getCategories(tenantId?: string): Promise<string[]> {
     await this.ensureReady();
+    const targetTenant = tenantId || this.activeTenantId;
+    if (!targetTenant) {
+      throw new Error('[LocalDB] tenantId is required to query categories');
+    }
     const rows = await this.driver.query<{ category: string }>(
-      'SELECT DISTINCT category FROM local_products WHERE category IS NOT NULL AND category != "" ORDER BY category ASC;'
+      'SELECT DISTINCT category FROM local_products WHERE category IS NOT NULL AND category != "" AND tenant_id = ? ORDER BY category ASC;',
+      [targetTenant]
     );
     return rows.map((r) => r.category);
   }
@@ -329,7 +486,7 @@ export class LocalDatabase {
    * 2. Insert em local_sales.
    * 3. Insert em local_sale_items.
    * 4. Insert em local_sale_payments.
-   * 5. Baixa de estoque em local_products e log em local_stock_movements.
+   * 5. Baixa de estoque em local_products com filtro estrito de tenant e log em local_stock_movements.
    * 6. Insert em outbox_operations.
    *
    * Se qualquer etapa falhar, ocorre ROLLBACK completo e o erro é propagado.
@@ -413,17 +570,17 @@ export class LocalDatabase {
           ]
         );
 
-        // Baixa de estoque e movimentação
+        // Baixa de estoque e movimentação com validação estrita de tenantId
         const prodRows = await tx.query<{ current_stock: number }>(
-          'SELECT current_stock FROM local_products WHERE id = ?;',
-          [item.productId]
+          'SELECT current_stock FROM local_products WHERE id = ? AND tenant_id = ?;',
+          [item.productId, sale.tenantId]
         );
         const prevStock = prodRows.length > 0 ? Number(prodRows[0].current_stock) : 0;
         const newStock = prevStock - item.quantity;
 
         await tx.execute(
-          'UPDATE local_products SET current_stock = current_stock - ? WHERE id = ?;',
-          [item.quantity, item.productId]
+          'UPDATE local_products SET current_stock = current_stock - ? WHERE id = ? AND tenant_id = ?;',
+          [item.quantity, item.productId, sale.tenantId]
         );
 
         const movementId = `mov_${sale.id}_${item.productId}_${i + 1}`;
@@ -826,11 +983,13 @@ export class LocalDatabase {
 
   public async seedDemoProductsIfEmpty(tenantId: string): Promise<void> {
     await this.ensureReady();
+    this.setActiveTenantId(tenantId);
     const countRows = await this.driver.query<{ count: number }>(
-      'SELECT COUNT(*) as count FROM local_products;'
+      'SELECT COUNT(*) as count FROM local_products WHERE tenant_id = ?;',
+      [tenantId]
     );
     if (countRows.length > 0 && Number(countRows[0].count) > 0) {
-      await this.loadProductsIntoCache();
+      await this.loadProductsIntoCache(tenantId);
       return;
     }
 
@@ -846,6 +1005,7 @@ export class LocalDatabase {
         currentStock: 35,
         unit: 'UN',
         category: 'Mercearia',
+        ncm: '09012100',
         isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -861,6 +1021,7 @@ export class LocalDatabase {
         currentStock: 42,
         unit: 'UN',
         category: 'Mercearia',
+        ncm: '10063021',
         isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -876,6 +1037,7 @@ export class LocalDatabase {
         currentStock: 8,
         unit: 'UN',
         category: 'Mercearia',
+        ncm: '15079011',
         isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -891,6 +1053,7 @@ export class LocalDatabase {
         currentStock: 28,
         unit: 'UN',
         category: 'Bebidas',
+        ncm: '22021000',
         isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -906,6 +1069,7 @@ export class LocalDatabase {
         currentStock: 64,
         unit: 'UN',
         category: 'Higiene',
+        ncm: '34011190',
         isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -921,13 +1085,14 @@ export class LocalDatabase {
         currentStock: 5,
         unit: 'UN',
         category: 'Limpeza',
+        ncm: '34022000',
         isActive: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       },
     ];
 
-    await this.upsertDeltaProducts(demoItems, Date.now());
+    await this.upsertDeltaProducts(demoItems, Date.now(), tenantId);
   }
 
   public async recordCashMovement(movement: CashMovement): Promise<void> {

@@ -1,4 +1,5 @@
 import { Sale, SystemSignal, StockMovement } from '@pdv/shared';
+import * as crypto from 'crypto';
 import type * as admin from 'firebase-admin';
 
 export interface CloudSaleResult {
@@ -11,12 +12,50 @@ export interface CloudSaleResult {
 
 export interface FirestoreTransactionContext {
   getOperation(tenantId: string, operationId: string): Promise<any>;
+  getSale?(tenantId: string, saleId: string): Promise<Sale | null>;
   getProduct(tenantId: string, productId: string): Promise<any>;
   saveSale(tenantId: string, sale: Sale): Promise<void>;
   updateProductStock(tenantId: string, productId: string, newStock: number): Promise<void>;
   recordStockMovement(tenantId: string, movement: StockMovement): Promise<void>;
   saveSignal(tenantId: string, signal: SystemSignal): Promise<void>;
   recordOperation(tenantId: string, operationId: string, data: any): Promise<void>;
+}
+
+/**
+ * Calcula o hash canônico SHA-256 sobre os campos comerciais da venda com ordenação determinística.
+ */
+export function computeCanonicalSaleHash(sale: Sale): string {
+  const sortedItems = [...sale.items]
+    .sort((a, b) => a.productId.localeCompare(b.productId))
+    .map((i) => ({
+      productId: i.productId,
+      quantity: i.quantity,
+      unitPrice: i.unitPrice,
+      discount: i.discount || 0,
+      totalPrice: i.totalPrice,
+    }));
+
+  const sortedPayments = [...sale.payments]
+    .sort((a, b) => a.method.localeCompare(b.method))
+    .map((p) => ({
+      method: p.method,
+      amount: p.amount,
+      changeAmount: p.changeAmount || 0,
+    }));
+
+  const canonicalPayload = {
+    tenantId: sale.tenantId,
+    saleId: sale.id,
+    sessionId: sale.sessionId,
+    deviceId: sale.deviceId,
+    subtotal: sale.subtotal,
+    discount: sale.discount,
+    total: sale.total,
+    items: sortedItems,
+    payments: sortedPayments,
+  };
+
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalPayload)).digest('hex');
 }
 
 /**
@@ -115,6 +154,10 @@ export function validateSalePayload(sale: Sale, expectedTenantId?: string): void
     if (change < 0) {
       throw new Error(`INVALID_PAYLOAD: Pagamento #${pIdx + 1} possui troco negativo.`);
     }
+    // Pagamentos não em dinheiro (PIX, Cartão, Fiado) não podem ter changeAmount > 0
+    if (p.method !== 'DINHEIRO' && change > 0) {
+      throw new Error(`INVALID_PAYLOAD: Pagamentos na forma "${p.method}" não podem conter troco (changeAmount > 0).`);
+    }
     totalEffectivePayments += p.amount - change;
   }
 
@@ -122,6 +165,11 @@ export function validateSalePayload(sale: Sale, expectedTenantId?: string): void
   if (totalEffectivePayments < sale.total - 0.05) {
     throw new Error(
       `INVALID_PAYLOAD: Total pago líquido (R$ ${totalEffectivePayments.toFixed(2)}) é inferior ao total da venda (R$ ${sale.total.toFixed(2)}).`
+    );
+  }
+  if (totalEffectivePayments > sale.total + 0.05) {
+    throw new Error(
+      `INVALID_PAYLOAD: Total pago líquido (R$ ${totalEffectivePayments.toFixed(2)}) excede o total da venda (R$ ${sale.total.toFixed(2)}).`
     );
   }
 }
@@ -140,6 +188,12 @@ export class RealFirestoreTransactionAdapter implements FirestoreTransactionCont
     const ref = this.firestore.doc(`tenants/${tenantId}/operations/${operationId}`);
     const snap = await this.tx.get(ref);
     return snap.exists ? snap.data() : null;
+  }
+
+  async getSale(tenantId: string, saleId: string): Promise<Sale | null> {
+    const ref = this.firestore.doc(`tenants/${tenantId}/sales/${saleId}`);
+    const snap = await this.tx.get(ref);
+    return snap.exists ? (snap.data() as Sale) : null;
   }
 
   async getProduct(tenantId: string, productId: string): Promise<any> {
@@ -199,7 +253,7 @@ export async function executeFirestoreSaleTransaction(
  * 2. ORDEM ESTRITA DE TRANSAÇÃO: Todas as leituras (operação + todos os produtos)
  *    são executadas ANTES de qualquer escrita (exigência indispensável do Firestore).
  * 3. Consolidação de quantidades para produtos que aparecem em múltiplos itens da mesma venda.
- * 4. Detecção de divergência comercial para mesmo operationId (rejeita alterações silenciosas).
+ * 4. Detecção de divergência comercial para mesmo operationId (rejeita alterações silenciosas via hash canônico).
  * 5. Escritas atômicas: venda, movimentações de estoque, atualização de saldo, sinais e comprovante de operação.
  * 6. Suporte a estoque negativo para vendas físicas válidas com emissão de SystemSignal auditável.
  */
@@ -213,6 +267,7 @@ export class CloudSaleHandler {
     validateSalePayload(sale, tenantId);
 
     const opId = sale.operationId || sale.id;
+    const currentCanonicalHash = computeCanonicalSaleHash(sale);
 
     // -----------------------------------------------------------------------
     // FASE 1: LEITURAS (TODAS AS LEITURAS ANTES DE QUALQUER ESCRITA)
@@ -221,17 +276,22 @@ export class CloudSaleHandler {
     // Leitura 1: Comprovante de Operação existente (verificação de idempotência e divergência)
     const existingOp = await tx.getOperation(tenantId, opId);
     if (existingOp) {
-      // Detecção de conteúdo comercial divergente para o mesmo operationId
-      const sameSaleId = !existingOp.saleId || existingOp.saleId === sale.id;
-      const sameTotal = Math.abs(Number(existingOp.total) - Number(sale.total)) < 0.01;
-      const sameSubtotal =
-        existingOp.subtotal === undefined || Math.abs(Number(existingOp.subtotal) - Number(sale.subtotal)) < 0.01;
-      const sameItemsCount =
-        existingOp.itemsCount === undefined || Number(existingOp.itemsCount) === sale.items.length;
+      let isIdentical = false;
+      if (existingOp.canonicalHash) {
+        isIdentical = existingOp.canonicalHash === currentCanonicalHash;
+      } else {
+        const sameSaleId = !existingOp.saleId || existingOp.saleId === sale.id;
+        const sameTotal = Math.abs(Number(existingOp.total) - Number(sale.total)) < 0.01;
+        const sameSubtotal =
+          existingOp.subtotal === undefined || Math.abs(Number(existingOp.subtotal) - Number(sale.subtotal)) < 0.01;
+        const sameItemsCount =
+          existingOp.itemsCount === undefined || Number(existingOp.itemsCount) === sale.items.length;
+        isIdentical = sameSaleId && sameTotal && sameSubtotal && sameItemsCount;
+      }
 
-      if (!sameSaleId || !sameTotal || !sameSubtotal || !sameItemsCount) {
+      if (!isIdentical) {
         throw new Error(
-          `INTEGRITY_CONFLICT: Operação comercial "${opId}" já foi gravada com dados divergentes (Existente: Sale=${existingOp.saleId}, Total=R$ ${existingOp.total}; Recebido: Sale=${sale.id}, Total=R$ ${sale.total}). Rejeitando alteração.`
+          `INTEGRITY_CONFLICT: Operação comercial "${opId}" já foi gravada com dados divergentes (hash divergente). Rejeitando alteração.`
         );
       }
 
@@ -241,6 +301,17 @@ export class CloudSaleHandler {
         saleId: sale.id,
         message: `Operação "${opId}" já processada com sucesso anteriormente. Re-execução ignorada.`,
       };
+    }
+
+    // Leitura 1b: Se a operação é nova, verifica se o saleId já foi gravado sob outro operationId
+    // para prevenir duplicidade de venda com redução duplicada de estoque
+    if (tx.getSale) {
+      const existingSale = await tx.getSale(tenantId, sale.id);
+      if (existingSale && (existingSale.operationId || existingSale.id) !== opId) {
+        throw new Error(
+          `INTEGRITY_CONFLICT: Venda com saleId "${sale.id}" já foi gravada sob outra operação ("${existingSale.operationId || existingSale.id}"). Rejeitando duplicidade de venda.`
+        );
+      }
     }
 
     // Consolidação de quantidades por produto: produtos repetidos em diferentes itens são somados
@@ -352,6 +423,7 @@ export class CloudSaleHandler {
       discount: sale.discount,
       total: sale.total,
       itemsCount: sale.items.length,
+      canonicalHash: currentCanonicalHash,
       processedAt: now,
     });
 

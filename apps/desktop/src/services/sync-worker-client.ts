@@ -102,8 +102,6 @@ export class SyncWorkerClient {
 
       for (const op of claimedOperations) {
         try {
-          const sale: Sale = JSON.parse(op.payload);
-
           // 2. Aplica timeout individual ao envio para que chamadas travadas não paralisem o worker
           const timeoutPromise = new Promise<never>((_, reject) => {
             const timer = setTimeout(() => {
@@ -114,7 +112,18 @@ export class SyncWorkerClient {
             }
           });
 
-          const result = await Promise.race([this.syncHandler(op, sale), timeoutPromise]);
+          let result: { success: boolean; error?: string };
+
+          if (op.type === 'CATALOG_PRODUCT_UPSERT' || op.type === 'CATALOG_PRODUCT_TOGGLE') {
+            // Roteamento específico para eventos de catálogo (evita parse indevido como Sale)
+            const payload = JSON.parse(op.payload);
+            const catalogPromise = CloudApiClient.processCatalogTransaction(payload, op.type);
+            result = await Promise.race([catalogPromise, timeoutPromise]);
+          } else {
+            // Eventos de venda padrão (SALE_CREATED, etc.)
+            const sale: Sale = JSON.parse(op.payload);
+            result = await Promise.race([this.syncHandler(op, sale), timeoutPromise]);
+          }
 
           if (result && result.success) {
             await localDb.markOutboxSuccess(op.operationId);

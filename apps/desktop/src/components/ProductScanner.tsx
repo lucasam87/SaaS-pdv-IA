@@ -6,9 +6,10 @@ import { localDb } from '../db/local-db';
 interface ProductScannerProps {
   onAddProduct: (product: Product, quantity: number) => void;
   disabled?: boolean;
+  tenantId?: string;
 }
 
-export const ProductScanner: React.FC<ProductScannerProps> = ({ onAddProduct, disabled }) => {
+export const ProductScanner: React.FC<ProductScannerProps> = ({ onAddProduct, disabled, tenantId }) => {
   const [inputValue, setInputValue] = useState('');
   const [searchResults, setSearchResults] = useState<Product[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -34,7 +35,7 @@ export const ProductScanner: React.FC<ProductScannerProps> = ({ onAddProduct, di
 
     // Se tiver mais de 2 caracteres e não for só número de código de barras, busca por nome
     if (val.trim().length >= 2 && isNaN(Number(val))) {
-      const results = localDb.search(val, 6);
+      const results = localDb.search(val, 6, tenantId);
       setSearchResults(results);
       setSelectedIndex(0);
     } else {
@@ -87,7 +88,7 @@ export const ProductScanner: React.FC<ProductScannerProps> = ({ onAddProduct, di
     }
 
     // Busca instantânea no SQLite Local (< 1ms)
-    const product = localDb.findByBarcode(barcode);
+    const product = localDb.findByBarcode(barcode, tenantId);
 
     if (product) {
       onAddProduct(product, qty);

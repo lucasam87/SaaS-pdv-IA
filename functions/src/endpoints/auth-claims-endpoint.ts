@@ -1,4 +1,4 @@
-﻿import * as admin from 'firebase-admin';
+import * as admin from 'firebase-admin';
 import { onRequest, onCall, HttpsError } from 'firebase-functions/v2/https';
 import { UserRole, TenantPrivateSecrets } from '@pdv/shared';
 import { verifyAuthToken, AuthenticatedUserContext } from './sale-endpoint';
@@ -39,30 +39,69 @@ export async function assignUserClaims(
   // 1. Validação independente de autorização
   assertTenantAdmin(caller, targetTenantId);
 
+  // 2. Prevenção de auto-elevação de privilégios
+  if (caller.uid === targetUid) {
+    throw new Error(
+      'PERMISSION_DENIED: Auto-elevação de privilégios não permitida. Modificação de permissões deve ser realizada por outro administrador.'
+    );
+  }
+
   const validRoles: UserRole[] = ['ADMIN', 'MANAGER', 'CASHIER'];
   if (!validRoles.includes(newRole)) {
     throw new Error(`INVALID_ARGUMENT: Papel "${newRole}" inválido. Permitidos: ${validRoles.join(', ')}.`);
   }
 
-  // 2. Gravação das Custom Claims via Firebase Admin SDK
-  await admin.auth().setCustomUserClaims(targetUid, {
+  // 3. Validação de existência e vínculo de tenant do usuário alvo
+  let targetUserRecord: admin.auth.UserRecord;
+  try {
+    targetUserRecord = await admin.auth().getUser(targetUid);
+  } catch (err: any) {
+    throw new Error(`NOT_FOUND: Usuário alvo "${targetUid}" não encontrado no serviço de autenticação.`);
+  }
+
+  const previousClaims = (targetUserRecord.customClaims || {}) as Record<string, unknown>;
+  const currentTenant = previousClaims.tenantId as string | undefined;
+  if (currentTenant && currentTenant !== targetTenantId) {
+    throw new Error(
+      `PERMISSION_DENIED: Usuário alvo já está vinculado a outro tenant ("${currentTenant}"). Transferência cross-tenant não permitida.`
+    );
+  }
+
+  // 4. Gravação das Custom Claims via Firebase Admin SDK
+  const newClaims = {
     tenantId: targetTenantId,
     role: newRole,
-  });
+  };
+  await admin.auth().setCustomUserClaims(targetUid, newClaims);
 
-  // 3. Atualização do documento do usuário no Firestore
+  const now = Date.now();
+
+  // 5. Atualização do documento do usuário no Firestore
   const userRef = admin.firestore().doc(`tenants/${targetTenantId}/users/${targetUid}`);
   await userRef.set(
     {
       id: targetUid,
       tenantId: targetTenantId,
       role: newRole,
-      updatedAt: Date.now(),
+      updatedAt: now,
     },
     { merge: true }
   );
 
-  // 4. Revogação de tokens para forçar refresh e aplicar novas claims
+  // 6. Registro de log de auditoria estruturado no Firestore
+  const auditLogRef = admin.firestore().collection(`tenants/${targetTenantId}/audit_logs`).doc();
+  await auditLogRef.set({
+    id: auditLogRef.id,
+    tenantId: targetTenantId,
+    action: 'ASSIGN_USER_CLAIMS',
+    adminUserId: caller.uid,
+    targetUserId: targetUid,
+    previousClaims,
+    newClaims,
+    timestamp: now,
+  });
+
+  // 7. Revogação de tokens para forçar refresh e aplicar novas claims
   await admin.auth().revokeRefreshTokens(targetUid);
 
   return {

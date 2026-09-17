@@ -3,7 +3,8 @@ import { ISqliteDriver } from './sqlite-driver';
 export interface Migration {
   version: number;
   description: string;
-  sql: string[];
+  sql?: string[];
+  run?: (tx: ISqliteDriver) => Promise<void>;
 }
 
 export const MIGRATIONS: Migration[] = [
@@ -158,6 +159,48 @@ export const MIGRATIONS: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_outbox_queue ON outbox_operations(status, next_attempt_at, created_at);`,
     ],
   },
+  {
+    version: 3,
+    description: 'Add NCM column, tenant-barcode unique constraint, tenant indexes on products',
+    run: async (tx: ISqliteDriver) => {
+      // 1. Adiciona coluna ncm se ainda não existir
+      const productColumns = await tx.query<{ name: string }>(`PRAGMA table_info(local_products);`);
+      const hasNcm = productColumns.some((col) => col.name === 'ncm');
+      if (!hasNcm) {
+        await tx.execute(`ALTER TABLE local_products ADD COLUMN ncm TEXT;`);
+      }
+
+      // 2. Diagnóstico de duplicidades existentes de código de barras por tenant antes de aplicar o índice único
+      const duplicates = await tx.query<{ tenant_id: string; barcode: string; count: number }>(
+        `SELECT tenant_id, barcode, COUNT(*) as count 
+         FROM local_products 
+         GROUP BY tenant_id, barcode 
+         HAVING count > 1;`
+      );
+
+      if (duplicates.length > 0) {
+        const details = duplicates
+          .map((d) => `Tenant: "${d.tenant_id}", Barcode: "${d.barcode}" (${d.count}x)`)
+          .join('; ');
+        throw new Error(
+          `[Migration v3] Impossível criar restrição de unicidade de código de barras: foram encontrados produtos duplicados no banco de dados (${details}). Corrija os registros conflitantes antes de aplicar a migration.`
+        );
+      }
+
+      // 3. Cria índice único por tenant e código de barras
+      await tx.execute(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tenant_barcode ON local_products(tenant_id, barcode);`
+      );
+
+      // 4. Cria índices de alta performance para busca e filtragem isoladas por tenant
+      await tx.execute(
+        `CREATE INDEX IF NOT EXISTS idx_products_tenant_name ON local_products(tenant_id, name);`
+      );
+      await tx.execute(
+        `CREATE INDEX IF NOT EXISTS idx_products_tenant_active ON local_products(tenant_id, is_active);`
+      );
+    },
+  },
 ];
 
 export async function runMigrations(driver: ISqliteDriver): Promise<void> {
@@ -175,8 +218,13 @@ export async function runMigrations(driver: ISqliteDriver): Promise<void> {
   for (const migration of MIGRATIONS) {
     if (!appliedVersions.has(migration.version)) {
       await driver.transaction(async (tx) => {
-        for (const statement of migration.sql) {
-          await tx.execute(statement);
+        if (migration.sql) {
+          for (const statement of migration.sql) {
+            await tx.execute(statement);
+          }
+        }
+        if (migration.run) {
+          await migration.run(tx);
         }
         await tx.execute(
           'INSERT INTO _migrations (version, description, applied_at) VALUES (?, ?, ?);',
@@ -186,4 +234,3 @@ export async function runMigrations(driver: ISqliteDriver): Promise<void> {
     }
   }
 }
-

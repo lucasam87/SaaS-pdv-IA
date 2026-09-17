@@ -1,6 +1,6 @@
 # Status do Projeto — SaaS PDV IA
 
-**Data de Atualização:** 16/09/2026  
+**Data de Atualização:** 17/09/2026  
 **Repositório:** [https://github.com/lucasam87/SaaS-pdv-IA](https://github.com/lucasam87/SaaS-pdv-IA)  
 **Branch:** `fix/audit-hardening`  
 **Stack Tecnológica:** Monorepo npm, TypeScript, React 18, Vite, Tailwind CSS, Tauri (Rust), SQLite (local) e Firebase (Functions, Firestore, Auth).
@@ -20,12 +20,12 @@ O **SaaS PDV IA** é um sistema de frente de caixa e retaguarda desenhado especi
 - [x] **Compatibilidade Híbrida do SQLite Local (`sqlite-driver.ts`)**:
   - `NodeSqliteDriver`: Para testes automatizados e ambiente Node com `node:sqlite`.
   - `TauriSqliteDriver`: Para a aplicação desktop empacotada em Tauri.
-  - `BrowserSqliteDriver` (WebAssembly): Implementado com `sql.js` local (`/sql-wasm.js` e `.wasm` offline), permitindo desenvolvimento, testes de interface e homologação rápida em qualquer navegador comum sem travar ou exigir compilador Rust em tempo de desenvolvimento.
+  - `BrowserSqliteDriver` (WebAssembly & IndexedDB): Implementado com `sql.js` local (`/sql-wasm.js` e `.wasm` offline), persistência atômica em IndexedDB por tenant, snapshot pós-commit, proteção contra crash-loop em caso de corrupção e fallback automático em Node.js.
 
 ---
 
-### 2. Endurecimento Arquitetural e Auditoria (Tasks 1 a 6 — Testes Automatizados)
-Foram executadas baterias de testes com **15 suítes automatizadas (`test-verification.ts`) 100% aprovadas**:
+### 2. Endurecimento Arquitetural e Auditoria (Tasks 1 a 6.5 — Testes Automatizados)
+Foram executadas baterias de testes com **16 suítes automatizadas (`test-verification.ts`) 100% aprovadas**:
 
 - [x] **Task 1 — Eliminação de Confirmações Falsas de Sincronização**:
   - Remoção de mocks que simulavam sincronização remota sem enviar dados.
@@ -51,15 +51,27 @@ Foram executadas baterias de testes com **15 suítes automatizadas (`test-verifi
   - Regras no `firestore.rules` bloqueando gravação direta de vendas por clientes contornando o backend.
   - Isolamento multi-tenant estrito (Cross-Tenant bloqueado).
   - Proteção de segredos e configurações privadas (`private_config`).
+- [x] **Task 6.5 — Estabilização do Módulo de Produtos & Hardening**:
+  - **BrowserSqliteDriver Durável**: Snapshots persistidos no IndexedDB sob demanda pós-commit DDL/DML; rollback seguro sem salvar dados abortados; exportação binária para backup e importação com verificação de integridade; proteção contra crash-loop isolando bancos corrompidos e gerando banco limpo sem travar o boot.
+  - **Isolamento Multi-Tenant Estrito**: Cache e buscas síncronas indexadas por chave composta `${tenantId}:${barcode}` e `${tenantId}:${id}`; listagens (`getAllProducts`) e agrupamento de categorias filtradas por `tenant_id`; rejeição imediata com `ValidationError` para deltas de tenants divergentes.
+  - **Persistência e Validação de NCM**: Migration v3 adicionando coluna `ncm TEXT`; validação fiscal rigorosa (2 a 8 dígitos numéricos); sanitização de pontuação (`0901.21.00` -> `09012100`); mapeamento íntegro na leitura, escrita e deltas.
+  - **Unicidade de Código de Barras por Tenant**: Índice único `idx_products_tenant_barcode(tenant_id, barcode)` no SQLite; diagnóstico pré-migração sem exclusão cega de dados; transação atômica que permite colisão do mesmo barcode em tenants distintos mas bloqueia dentro do mesmo tenant.
+  - **Validação Estrita de Produtos**: Rejeição de campos vazios, caracteres de controle em barcodes, números NaN/Infinity, custo negativo, preço de venda menor ou igual a zero, estoque mínimo negativo e enum de unidades inválido; eliminação de fallbacks permissivos silenciosos (`parseFloat || 0`).
+  - **Catálogo Transacional na Outbox**: Operações de catálogo (`CATALOG_PRODUCT_UPSERT` e `CATALOG_PRODUCT_TOGGLE`) gravadas na mesma transação SQLite da alteração local; `SyncWorkerClient` com roteamento específico por `type` sem converter incorretamente eventos de catálogo para vendas.
+  - **Validação de Resposta da Nuvem (`CloudApiClient`)**: Rejeição tipada (`CloudResponseError`) para respostas HTML de proxy/gateway, respostas JSON com `success: false` e divergência de IDs entre a requisição e a resposta confirmada.
+  - **Contrato Financeiro de Dinheiro e Troco**: No `PaymentModal` e no backend, `amount` armazena o valor recebido (tender) e `changeAmount` o troco concedido; valor comercial efetivo = `amount - changeAmount`; troco estritamente bloqueado para formas não-dinheiro (PIX, Cartão).
+  - **Idempotência Canônica SHA-256 no Servidor**: Hash criptográfico determinístico gerado sobre os campos comerciais da venda; mesma `operationId` com dados alterados rejeitada com `INTEGRITY_CONFLICT`; `sale.id` reutilizado em operações diferentes bloqueado.
+  - **Atribuição de Permissões Segura (`assignUserClaims`)**: Bloqueio de auto-elevação de privilégios (`caller.uid === targetUid`), validação de que o usuário alvo pertence ao tenant do administrador chamador e registro de trilha de auditoria em `tenants/{tenantId}/audit_logs`.
+  - **Exclusividade de Conexão no SQLite**: Fila assíncrona `AsyncMutex` impedindo que queries diretas concorram com transações abertas; driver contextual com comandos diretos internos evitando deadlocks.
 
 ---
 
 ### 3. Módulo de Gestão & Cadastro de Produtos (Backoffice)
 - [x] **Métodos CRUD no SQLite Local (`local-db.ts`)**:
-  - `getAllProducts(includeInactive)`: listagem completa com suporte a inativos.
-  - `saveProduct(input)`: criação e edição com validação de unicidade de código de barras e sincronização imediata com o cache de memória do leitor do caixa.
-  - `toggleProductStatus(id)`: ativação/desativação instantânea.
-  - `getCategories()`: agrupamento dinâmico de categorias.
+  - `getAllProducts(includeInactive)`: listagem completa com suporte a inativos e isolamento por tenant.
+  - `saveProduct(input)`: criação e edição com validação estrita, unicidade de código de barras por tenant e sincronização imediata com o cache de memória do leitor do caixa.
+  - `toggleProductStatus(id)`: ativação/desativação instantânea com evento transacional na outbox.
+  - `getCategories()`: agrupamento dinâmico de categorias isoladas por tenant.
 - [x] **Tela de Catálogo & Estoque (`ProductsView.tsx`)**:
   - Cards de KPIs no topo: Total de Produtos Ativos, Total com Estoque Baixo, Custo Total em Estoque (R$) e Valor Potencial de Venda (R$).
   - Campo de busca instantânea (por nome, código de barras ou categoria).
@@ -85,7 +97,7 @@ Foram executadas baterias de testes com **15 suítes automatizadas (`test-verifi
   - Substituir a sessão em memória mockada (`session_001` no `App.tsx`) pela leitura real da última sessão aberta no SQLite local.
   - Manter sessão aberta persistente ao reiniciar a aplicação ou fechar a aba.
   - Cálculo estrito de fechamento cego com base nos pagamentos, sangrias e suprimentos persistidos.
-  - Correção na forma como o troco é enviado para a Cloud Function (evitar rejeição de vendas em dinheiro com troco).
+  - Integração do contrato financeiro de troco com a nova sessão persistida.
 - [ ] **Task 8 — Reconciliação Delta de Estoque & Isolamento Multi-Tenant**:
   - Separar saldo remoto confirmado de baixas pendentes na fila local para evitar sobreposição incorreta de estoque.
   - Implementar paginação por cursor temporal com desempate de timestamp nas sincronizações remotas.
@@ -126,7 +138,7 @@ Foram executadas baterias de testes com **15 suítes automatizadas (`test-verifi
    npm ci
    ```
 
-2. **Rodar a suíte de testes de auditoria (15 testes):**
+2. **Rodar a suíte de testes de auditoria (16 testes):**
    ```bash
    npx tsx test-verification.ts
    ```

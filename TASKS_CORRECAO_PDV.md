@@ -23,11 +23,12 @@ Base: revisão do [commit ad2f3bb](https://github.com/lucasam87/SaaS-pdv-IA/comm
 ## Controle de progresso
 
 - [x] Task 1 — Eliminar confirmações falsas de sincronização
-- [ ] Task 2 — Corrigir SQLite no Tauri
-- [ ] Task 3 — Persistir antes do envio
-- [ ] Task 4 — Implementar backend transacional autenticado
-- [ ] Task 5 — Recuperar e desbloquear a fila
-- [ ] Task 6 — Corrigir regras de segurança
+- [x] Task 2 — Corrigir SQLite no Tauri
+- [x] Task 3 — Persistir antes do envio
+- [x] Task 4 — Implementar backend transacional autenticado
+- [x] Task 5 — Recuperar e desbloquear a fila
+- [x] Task 6 — Corrigir regras de segurança
+- [x] Task 6.5 — Estabilização do módulo de produtos e correções pendentes da auditoria
 - [ ] Task 7 — Reconstruir caixa por dados persistidos
 - [ ] Task 8 — Reconciliar estoque e isolar dados locais
 - [ ] Task 9 — Separar venda e impressão
@@ -133,6 +134,41 @@ Base: revisão do [commit ad2f3bb](https://github.com/lucasam87/SaaS-pdv-IA/comm
 - [x] Revisar origem e manutenção das claims de tenant e papel.
 
 **Aceite:** emulador nega acesso cruzado, falso comprovante, leitura de segredos e alteração financeira indevida. Fluxos autorizados permanecem funcionais.
+
+## Task 6.5 — Estabilização do Módulo de Produtos e Auditoria
+
+**Arquivos:** `apps/desktop/src/db/sqlite-driver.ts`, `apps/desktop/src/db/schema.ts`, `apps/desktop/src/db/local-db.ts`, `apps/desktop/src/services/cloud-api-client.ts`, `apps/desktop/src/services/sync-worker-client.ts`, `apps/desktop/src/components/PaymentModal.tsx`, `apps/desktop/src/components/ProductFormModal.tsx`, `functions/src/cloud-sale-handler.ts`, `functions/src/endpoints/auth-claims-endpoint.ts`, `test-verification.ts`.
+
+### Ações
+
+- [x] **Critério 1 — BrowserSqliteDriver durável e tolerante**: Persistência via IndexedDB pós-commit, rollback safety sem persistir transações abortadas, export/import de banco binário, e prevenção de crash-loop com isolamento de backup corrompido e inicialização limpa.
+- [x] **Critério 2 — Isolamento estrito de tenant**: Chaves de busca e cache em memória mapeadas por `${tenantId}:${barcode}` e `${tenantId}:${id}`, listagens `getAllProducts` e `getCategories` filtradas por `tenant_id`, e deltas com tenant divergente rejeitados com `ValidationError`.
+- [x] **Critério 3 — Persistência e validação de NCM**: Coluna `ncm TEXT` adicionada na migração v3, validação estrita fiscal de 2 a 8 dígitos numéricos, sanitização de pontuação e propagação nos mappers e modelos.
+- [x] **Critério 4 — Unicidade de código de barras por tenant**: Restrição `UNIQUE(tenant_id, barcode)` criada via índice `idx_products_tenant_barcode`, rotina prévia de migração sem exclusão cega de duplicados, e validação atômica antes do insert.
+- [x] **Critério 5 — Validação estrita de produto**: Rejeição de campos vazios, caracteres de controle em barcodes, números NaN/Infinity, custo negativo, preço de venda menor ou igual a zero, estoque mínimo negativo e unidades fora do enum `ProductUnit`.
+- [x] **Critério 6 — Sincronização de catálogo via outbox**: Gravação de eventos `CATALOG_PRODUCT_UPSERT` e `CATALOG_PRODUCT_TOGGLE` na mesma transação SQLite, com roteamento dedicado no `SyncWorkerClient` sem converter catálogo para `Sale`.
+- [x] **Critério 7 — Validação de resposta da nuvem**: `CloudApiClient` valida `Content-Type: application/json`, status `success === true`, e integridade de correspondência de `saleId` e `operationId`. Respostas HTML de proxy ou falhas remotas são rejeitadas com `CloudResponseError`.
+- [x] **Critério 8 — Contrato financeiro de dinheiro e troco**: No `PaymentModal` e no backend, `amount` representa o valor entregue (tender) e `changeAmount` o troco devolvido. Pagamentos não-dinheiro têm troco estritamente proibido (`changeAmount === 0`).
+- [x] **Critério 9 — Idempotência canônica SHA-256**: Hash SHA-256 gerado no backend a partir dos campos determinísticos da venda. Tentativa com mesmo `operationId` e hash divergente é rejeitada com `INTEGRITY_CONFLICT`. Reuso de `saleId` sob outro `operationId` também é rejeitado.
+- [x] **Critério 10 — Atribuição de permissões (`assignUserClaims`)**: Bloqueio de auto-elevação de privilégios (`caller.uid === targetUid`), verificação de vínculo com o tenant do administrador, e gravação de log de auditoria em `tenants/{tenantId}/audit_logs`.
+- [x] **Critério 11 — Exclusividade de transação SQLite**: Consultas diretas e transações serializadas via `AsyncMutex`. `TransactionContextDriver` executa comandos internos sem deadlock e preserva isolamento completo.
+- [x] **Critério 12 — Suíte de testes automatizados**: Adicionada e aprovada a suíte `TESTE 16` no `test-verification.ts` comprovando os 11 critérios de forma determinística.
+
+**Aceite:** Todos os 16 testes automatizados de `test-verification.ts` passam com 100% de sucesso. Workspaces `@pdv/desktop` e `functions` compilam sem qualquer erro de TypeScript.
+
+### Modelo de entrega — Task 6.5
+
+| Campo | Preencher após execução |
+| --- | --- |
+| Task e estado | **Task 6.5 — Concluída com 100% de aprovação** |
+| Versão examinada | Commit base `9f1721c` na branch `fix/audit-hardening` |
+| Diagnóstico | Módulo de produtos continha persistência volátil no navegador, ausência de isolamento multi-tenant no cache, falta de NCM na migração v3, colisão global de barcode entre tenants distintos, validações permissivas com fallback silencioso (`parseFloat || 0`), e ausência de outbox para catálogo. |
+| Arquivos alterados | `apps/desktop/src/db/sqlite-driver.ts`, `apps/desktop/src/db/schema.ts`, `apps/desktop/src/db/local-db.ts`, `apps/desktop/src/services/cloud-api-client.ts`, `apps/desktop/src/services/sync-worker-client.ts`, `apps/desktop/src/components/PaymentModal.tsx`, `apps/desktop/src/components/ProductFormModal.tsx`, `apps/desktop/src/components/ProductsView.tsx`, `apps/desktop/src/components/ProductScanner.tsx`, `apps/desktop/src/components/Header.tsx`, `functions/src/cloud-sale-handler.ts`, `functions/src/endpoints/auth-claims-endpoint.ts`, `test-verification.ts`, `STATUS_PROJETO.md`, `TASKS_CORRECAO_PDV.md`. |
+| Correção | Persistência IndexedDB durável no browser com recuperação de corrupção, chaveamento multi-tenant por `${tenantId}:${barcode}`, migração v3 com NCM e `UNIQUE(tenant_id, barcode)`, validações tipadas `ValidationError`, outbox transacional para catálogo, validação estrita de rede no `CloudApiClient`, troco financeiro exato, idempotência via SHA-256 canônico, prevenção de auto-elevação em claims e isolamento via `AsyncMutex`. |
+| Validação | `npm --workspace=@pdv/desktop run build` (sucesso), `npm --workspace=functions run build` (sucesso) e `npx tsx test-verification.ts` (16 suítes / 16 aprovadas). |
+| Evidências | Testes automatizados executados com saída de código 0 cobrindo snapshots, rollback, NCM, barcode uniqueness, outbox catalog routing, cloud response validation, dinheiro/troco, SHA-256 idempotency, claims audit e mutex exclusivity. |
+| Limitações | Emuladores Firestore e testes com hardware térmico USB físico pertencem à homologação de Tasks 9 e 10. |
+| Próximo passo | Task 7 — Reconstruir caixa por dados persistidos. |
 
 ## Task 7 — Reconstruir caixa por dados persistidos
 

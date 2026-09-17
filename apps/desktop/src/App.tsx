@@ -100,6 +100,7 @@ export const App: React.FC = () => {
 
     const initDb = async () => {
       try {
+        localDb.setActiveTenantId(DEMO_TENANT_ID);
         await localDb.initialize();
         await localDb.seedDemoProductsIfEmpty(DEMO_TENANT_ID);
         if (isMounted) {
@@ -502,6 +503,7 @@ export const App: React.FC = () => {
                 Leitor de Código de Barras / Busca
               </h2>
               <ProductScanner
+                tenantId={DEMO_TENANT_ID}
                 onAddProduct={handleAddProduct}
                 disabled={currentSession?.status !== 'OPEN'}
               />
