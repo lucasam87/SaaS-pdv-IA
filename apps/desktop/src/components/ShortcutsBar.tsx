@@ -1,6 +1,8 @@
 import React from 'react';
 
 interface ShortcutsBarProps {
+  currentView?: 'PDV' | 'PRODUCTS';
+  onNavigate?: (view: 'PDV' | 'PRODUCTS') => void;
   onNewSale: () => void;
   onOpenCashModal: () => void;
   onFinalize: () => void;
@@ -8,6 +10,8 @@ interface ShortcutsBarProps {
 }
 
 export const ShortcutsBar: React.FC<ShortcutsBarProps> = ({
+  currentView = 'PDV',
+  onNavigate,
   onNewSale,
   onOpenCashModal,
   onFinalize,
@@ -16,6 +20,18 @@ export const ShortcutsBar: React.FC<ShortcutsBarProps> = ({
   return (
     <footer className="bg-slate-900 border-t border-slate-800 px-6 py-2 flex items-center justify-between text-xs select-none">
       <div className="flex items-center gap-2 flex-wrap">
+        {onNavigate && (
+          <button
+            onClick={() => onNavigate(currentView === 'PDV' ? 'PRODUCTS' : 'PDV')}
+            className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded-lg border border-slate-700/80 transition-colors"
+          >
+            <span className="bg-slate-900 text-emerald-400 font-mono font-bold px-1.5 py-0.5 rounded text-[11px]">
+              {currentView === 'PDV' ? 'F3' : 'F1'}
+            </span>
+            <span>{currentView === 'PDV' ? 'Gestão Produtos' : 'Voltar ao PDV'}</span>
+          </button>
+        )}
+
         <button
           onClick={onNewSale}
           className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded-lg border border-slate-700/80 transition-colors"

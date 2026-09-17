@@ -1,5 +1,5 @@
 import React from 'react';
-import { Store, User, Wifi, WifiOff, RefreshCw, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Store, User, Wifi, WifiOff, RefreshCw, AlertCircle, CheckCircle2, ShoppingCart, Boxes } from 'lucide-react';
 import { CashSession } from '@pdv/shared';
 
 export interface HeaderOutboxStats {
@@ -8,6 +8,8 @@ export interface HeaderOutboxStats {
   failed: number;
   synced: number;
 }
+
+export type AppView = 'PDV' | 'PRODUCTS';
 
 interface HeaderProps {
   storeName: string;
@@ -18,6 +20,8 @@ interface HeaderProps {
   isOnline: boolean;
   outboxStats?: HeaderOutboxStats;
   pendingSyncCount: number;
+  currentView?: AppView;
+  onNavigate?: (view: AppView) => void;
   onSyncNow: () => void;
   onOpenCashModal: () => void;
 }
@@ -31,6 +35,8 @@ export const Header: React.FC<HeaderProps> = ({
   isOnline,
   outboxStats,
   pendingSyncCount,
+  currentView = 'PDV',
+  onNavigate,
   onSyncNow,
   onOpenCashModal,
 }) => {
@@ -52,6 +58,34 @@ export const Header: React.FC<HeaderProps> = ({
           </p>
         </div>
       </div>
+
+      {/* Navegação Rápida entre Módulos */}
+      {onNavigate && (
+        <nav className="flex items-center gap-1.5 bg-slate-950/70 p-1 rounded-xl border border-slate-800">
+          <button
+            onClick={() => onNavigate('PDV')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+              currentView === 'PDV'
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 shadow-sm'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <ShoppingCart className="w-3.5 h-3.5" />
+            <span>Frente de Caixa [F1]</span>
+          </button>
+          <button
+            onClick={() => onNavigate('PRODUCTS')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+              currentView === 'PRODUCTS'
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 shadow-sm'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+            }`}
+          >
+            <Boxes className="w-3.5 h-3.5" />
+            <span>Produtos & Estoque [F3]</span>
+          </button>
+        </nav>
+      )}
 
       {/* Status do Caixa */}
       <div className="flex items-center gap-4">

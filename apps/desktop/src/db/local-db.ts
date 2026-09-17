@@ -49,10 +49,14 @@ export class LocalDatabase {
     }
     if (!this.initPromise) {
       this.initPromise = (async () => {
+        console.log('[LocalDB] initialize: Running migrations...');
         await runMigrations(this.driver);
+        console.log('[LocalDB] initialize: Migrations completed, loading cache...');
         await this.loadProductsIntoCache();
+        console.log('[LocalDB] initialize: Products loaded, database ready.');
         this.initialized = true;
       })().catch((err) => {
+        console.error('[LocalDB] initialize error:', err);
         this.initPromise = null;
         throw err;
       });
@@ -184,6 +188,137 @@ export class LocalDatabase {
     });
 
     await this.loadProductsIntoCache();
+  }
+
+  /**
+   * Retorna todos os produtos do SQLite, com opção de incluir inativos.
+   */
+  public async getAllProducts(includeInactive: boolean = false): Promise<Product[]> {
+    await this.ensureReady();
+    const sql = includeInactive
+      ? 'SELECT * FROM local_products ORDER BY name ASC;'
+      : 'SELECT * FROM local_products WHERE is_active = 1 ORDER BY name ASC;';
+    const rows = await this.driver.query<Record<string, unknown>>(sql);
+    return rows.map((r) => ({
+      id: String(r.id),
+      tenantId: String(r.tenant_id),
+      name: String(r.name),
+      barcode: String(r.barcode),
+      costPrice: Number(r.cost_price),
+      sellingPrice: Number(r.selling_price),
+      minStock: Number(r.min_stock),
+      currentStock: Number(r.current_stock),
+      unit: (r.unit as ProductUnit) || 'UN',
+      category: (r.category as string) || 'Geral',
+      isActive: Boolean(r.is_active),
+      createdAt: Number(r.updated_at),
+      updatedAt: Number(r.updated_at),
+    }));
+  }
+
+  /**
+   * Salva ou atualiza um produto no SQLite e sincroniza o cache em memória do PDV.
+   */
+  public async saveProduct(
+    input: Omit<Product, 'id' | 'createdAt' | 'updatedAt'> & { id?: string; createdAt?: number; updatedAt?: number }
+  ): Promise<Product> {
+    await this.ensureReady();
+    const now = Date.now();
+    const id = input.id || `prod_${now}_${Math.floor(Math.random() * 1000)}`;
+    const barcode = input.barcode.trim();
+
+    // Valida unicidade de código de barras entre produtos ativos
+    const existingBarcode = await this.driver.query<{ id: string; name: string }>(
+      'SELECT id, name FROM local_products WHERE barcode = ? AND id != ? AND is_active = 1;',
+      [barcode, id]
+    );
+    if (existingBarcode.length > 0) {
+      throw new Error(`Código de barras "${barcode}" já está em uso pelo produto "${existingBarcode[0].name}".`);
+    }
+
+    const product: Product = {
+      id,
+      tenantId: input.tenantId,
+      name: input.name.trim(),
+      barcode,
+      costPrice: Number(input.costPrice),
+      sellingPrice: Number(input.sellingPrice),
+      minStock: Number(input.minStock),
+      currentStock: Number(input.currentStock),
+      unit: input.unit || 'UN',
+      category: input.category?.trim() || 'Geral',
+      isActive: input.isActive !== false,
+      createdAt: input.createdAt || now,
+      updatedAt: now,
+    };
+
+    await this.driver.execute(
+      `INSERT INTO local_products (
+        id, tenant_id, name, barcode, cost_price, selling_price,
+        min_stock, current_stock, unit, category, is_active, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name,
+        barcode = excluded.barcode,
+        cost_price = excluded.cost_price,
+        selling_price = excluded.selling_price,
+        min_stock = excluded.min_stock,
+        current_stock = excluded.current_stock,
+        unit = excluded.unit,
+        category = excluded.category,
+        is_active = excluded.is_active,
+        updated_at = excluded.updated_at;`,
+      [
+        product.id,
+        product.tenantId,
+        product.name,
+        product.barcode,
+        product.costPrice,
+        product.sellingPrice,
+        product.minStock,
+        product.currentStock,
+        product.unit,
+        product.category,
+        product.isActive ? 1 : 0,
+        now,
+      ]
+    );
+
+    // Atualiza imediatamente o cache de leitor e catálogo em memória
+    await this.loadProductsIntoCache();
+    return product;
+  }
+
+  /**
+   * Ativa ou desativa um produto no banco e reflete no cache.
+   */
+  public async toggleProductStatus(productId: string): Promise<boolean> {
+    await this.ensureReady();
+    const rows = await this.driver.query<{ is_active: number }>(
+      'SELECT is_active FROM local_products WHERE id = ?;',
+      [productId]
+    );
+    if (rows.length === 0) {
+      throw new Error(`Produto "${productId}" não encontrado.`);
+    }
+    const newStatus = rows[0].is_active === 1 ? 0 : 1;
+    await this.driver.execute(
+      'UPDATE local_products SET is_active = ?, updated_at = ? WHERE id = ?;',
+      [newStatus, Date.now(), productId]
+    );
+    await this.loadProductsIntoCache();
+    return newStatus === 1;
+  }
+
+  /**
+   * Retorna lista de categorias distintas existentes na loja.
+   */
+  public async getCategories(): Promise<string[]> {
+    await this.ensureReady();
+    const rows = await this.driver.query<{ category: string }>(
+      'SELECT DISTINCT category FROM local_products WHERE category IS NOT NULL AND category != "" ORDER BY category ASC;'
+    );
+    return rows.map((r) => r.category);
   }
 
   /**

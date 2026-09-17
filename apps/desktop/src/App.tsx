@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react';
-import { Header } from './components/Header';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Header, AppView } from './components/Header';
 import { ProductScanner } from './components/ProductScanner';
 import { CartTable } from './components/CartTable';
 import { PaymentModal } from './components/PaymentModal';
 import { CashSessionModal } from './components/CashSessionModal';
 import { ShortcutsBar } from './components/ShortcutsBar';
+import { ProductsView } from './components/ProductsView';
 import { localDb } from './db/local-db';
 import { ThermalPrinterService } from './services/printer-usb';
 import { DeviceConfigService } from './services/device-config';
@@ -48,6 +49,9 @@ export const App: React.FC = () => {
     };
   });
 
+  // Navegação da Aplicação (PDV vs Backoffice/Gestão)
+  const [currentView, setCurrentView] = useState<AppView>('PDV');
+
   // Estado da Venda Atual
   const [cartItems, setCartItems] = useState<SaleItem[]>([]);
   const [discount, setDiscount] = useState<number>(0);
@@ -57,6 +61,7 @@ export const App: React.FC = () => {
 
   // Estado de prontidão do banco SQLite
   const [isDbReady, setIsDbReady] = useState(false);
+  const [initError, setInitError] = useState<string | null>(null);
 
   // Sincronização & Rede Reativa
   const [isOnline, setIsOnline] = useState(() =>
@@ -65,15 +70,29 @@ export const App: React.FC = () => {
   const [outboxStats, setOutboxStats] = useState({ pending: 0, processing: 0, failed: 0, synced: 0, total: 0 });
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
 
-  const refreshSyncStats = async () => {
+  const refreshSyncStats = useCallback(async () => {
     try {
       const stats = await localDb.getOutboxStats();
-      setOutboxStats(stats);
-      setPendingSyncCount(stats.pending + stats.failed + stats.processing);
+      setOutboxStats((prev) => {
+        if (
+          prev.pending === stats.pending &&
+          prev.processing === stats.processing &&
+          prev.failed === stats.failed &&
+          prev.synced === stats.synced &&
+          prev.total === stats.total
+        ) {
+          return prev;
+        }
+        return stats;
+      });
+      setPendingSyncCount((prev) => {
+        const next = stats.pending + stats.failed + stats.processing;
+        return prev === next ? prev : next;
+      });
     } catch (err) {
       console.error('[App] Erro ao atualizar status da outbox:', err);
     }
-  };
+  }, []);
 
   // Inicialização, carga e escuta de eventos de rede
   useEffect(() => {
@@ -89,6 +108,9 @@ export const App: React.FC = () => {
         }
       } catch (err) {
         console.error('[App] Falha crítica na inicialização do SQLite local:', err);
+        if (isMounted) {
+          setInitError(err instanceof Error ? err.message : String(err));
+        }
       }
     };
 
@@ -127,8 +149,15 @@ export const App: React.FC = () => {
       // Se algum modal estiver aberto, não processa os atalhos de fundo
       if (isPaymentModalOpen || isCashModalOpen) return;
 
-      if (e.key === 'F2') {
+      if (e.key === 'F1') {
         e.preventDefault();
+        setCurrentView('PDV');
+      } else if (e.key === 'F3') {
+        e.preventDefault();
+        setCurrentView('PRODUCTS');
+      } else if (e.key === 'F2') {
+        e.preventDefault();
+        setCurrentView('PDV');
         handleNewSale();
       } else if (e.key === 'F8') {
         e.preventDefault();
@@ -139,19 +168,21 @@ export const App: React.FC = () => {
           setIsPaymentModalOpen(true);
         }
       } else if (e.key === 'Escape') {
-        e.preventDefault();
-        handleCancelSale();
+        if (currentView === 'PDV') {
+          e.preventDefault();
+          handleCancelSale();
+        }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cartItems, isPaymentModalOpen, isCashModalOpen, currentSession]);
+  }, [cartItems, isPaymentModalOpen, isCashModalOpen, currentSession, currentView]);
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 4000);
-  };
+  }, []);
 
   // Adiciona produto ao carrinho
   const handleAddProduct = (product: Product, quantity: number) => {
@@ -416,6 +447,12 @@ export const App: React.FC = () => {
         <div className="w-10 h-10 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin mb-4" />
         <h2 className="text-base font-bold text-slate-200">Inicializando SQLite Local</h2>
         <p className="text-xs text-slate-400 font-mono mt-1">Executando migrations e preparando cache em memória...</p>
+        {initError && (
+          <div className="mt-4 p-4 max-w-xl bg-rose-950/60 border border-rose-500/50 rounded-lg text-rose-300 text-xs font-mono select-text">
+            <p className="font-bold mb-1">Erro de inicialização:</p>
+            <p>{initError}</p>
+          </div>
+        )}
       </div>
     );
   }
@@ -432,6 +469,8 @@ export const App: React.FC = () => {
         isOnline={isOnline}
         outboxStats={outboxStats}
         pendingSyncCount={pendingSyncCount}
+        currentView={currentView}
+        onNavigate={setCurrentView}
         onSyncNow={async () => {
           showToast('Tentando sincronizar operações pendentes com o backend...');
           const res = await syncWorkerClient.syncOnce(true);
@@ -447,55 +486,65 @@ export const App: React.FC = () => {
         onOpenCashModal={() => setIsCashModalOpen(true)}
       />
 
-      {/* Corpo do PDV */}
-      <main className="flex-1 p-6 grid grid-cols-12 gap-6 overflow-hidden">
-        {/* Coluna Esquerda: Scanner de Produtos e Informações */}
-        <div className="col-span-5 flex flex-col gap-6">
-          <div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-xl space-y-3">
-            <h2 className="text-xs uppercase font-bold text-emerald-400 tracking-wider">
-              Leitor de Código de Barras / Busca
-            </h2>
-            <ProductScanner
-              onAddProduct={handleAddProduct}
-              disabled={currentSession?.status !== 'OPEN'}
+      {/* Corpo: PDV ou Gestão de Produtos */}
+      {currentView === 'PRODUCTS' ? (
+        <ProductsView
+          tenantId={DEMO_TENANT_ID}
+          onBackToPdv={() => setCurrentView('PDV')}
+          onShowToast={showToast}
+        />
+      ) : (
+        <main className="flex-1 p-6 grid grid-cols-12 gap-6 overflow-hidden">
+          {/* Coluna Esquerda: Scanner de Produtos e Informações */}
+          <div className="col-span-5 flex flex-col gap-6">
+            <div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-xl space-y-3">
+              <h2 className="text-xs uppercase font-bold text-emerald-400 tracking-wider">
+                Leitor de Código de Barras / Busca
+              </h2>
+              <ProductScanner
+                onAddProduct={handleAddProduct}
+                disabled={currentSession?.status !== 'OPEN'}
+              />
+            </div>
+
+            {/* Card Rápido de Dicas e Atalhos */}
+            <div className="flex-1 bg-slate-900/40 p-5 rounded-2xl border border-slate-800/60 flex flex-col justify-between">
+              <div className="space-y-2">
+                <span className="text-xs font-bold text-slate-400 uppercase">Dicas Rápidas do Caixa:</span>
+                <ul className="text-xs text-slate-400 space-y-1.5 list-disc pl-4 font-medium">
+                  <li>Bipe produtos direto com o leitor USB sem clicar na tela.</li>
+                  <li>Multiplicador: digite <code className="text-emerald-300 font-bold">3*codigo</code> para passar 3 unidades de uma vez.</li>
+                  <li>Pressione <code className="text-emerald-300 font-bold">F10</code> a qualquer momento para abrir a tela de pagamentos.</li>
+                </ul>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 flex items-center justify-between">
+                <span className="text-xs text-slate-400">Total na Gaveta (Dinheiro):</span>
+                <span className="text-lg font-mono font-bold text-slate-200">
+                  R$ {((currentSession?.initialAmount || 0) + (currentSession?.totalCashSales || 0) - (currentSession?.totalSangrias || 0) + (currentSession?.totalSuprimentos || 0)).toFixed(2)}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Coluna Direita: Carrinho de Compras e Totais */}
+          <div className="col-span-7 h-full">
+            <CartTable
+              items={cartItems}
+              onUpdateQuantity={handleUpdateQuantity}
+              onRemoveItem={handleRemoveItem}
+              subtotal={subtotal}
+              discount={discount}
+              total={total}
             />
           </div>
-
-          {/* Card Rápido de Dicas e Atalhos */}
-          <div className="flex-1 bg-slate-900/40 p-5 rounded-2xl border border-slate-800/60 flex flex-col justify-between">
-            <div className="space-y-2">
-              <span className="text-xs font-bold text-slate-400 uppercase">Dicas Rápidas do Caixa:</span>
-              <ul className="text-xs text-slate-400 space-y-1.5 list-disc pl-4 font-medium">
-                <li>Bipe produtos direto com o leitor USB sem clicar na tela.</li>
-                <li>Multiplicador: digite <code className="text-emerald-300 font-bold">3*codigo</code> para passar 3 unidades de uma vez.</li>
-                <li>Pressione <code className="text-emerald-300 font-bold">F10</code> a qualquer momento para abrir a tela de pagamentos.</li>
-              </ul>
-            </div>
-
-            <div className="p-3.5 rounded-xl bg-slate-900/80 border border-slate-800 flex items-center justify-between">
-              <span className="text-xs text-slate-400">Total na Gaveta (Dinheiro):</span>
-              <span className="text-lg font-mono font-bold text-slate-200">
-                R$ {((currentSession?.initialAmount || 0) + (currentSession?.totalCashSales || 0) - (currentSession?.totalSangrias || 0) + (currentSession?.totalSuprimentos || 0)).toFixed(2)}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        {/* Coluna Direita: Carrinho de Compras e Totais */}
-        <div className="col-span-7 h-full">
-          <CartTable
-            items={cartItems}
-            onUpdateQuantity={handleUpdateQuantity}
-            onRemoveItem={handleRemoveItem}
-            subtotal={subtotal}
-            discount={discount}
-            total={total}
-          />
-        </div>
-      </main>
+        </main>
+      )}
 
       {/* Barra de Atalhos Inferior */}
       <ShortcutsBar
+        currentView={currentView}
+        onNavigate={setCurrentView}
         onNewSale={handleNewSale}
         onOpenCashModal={() => setIsCashModalOpen(true)}
         onFinalize={() => {

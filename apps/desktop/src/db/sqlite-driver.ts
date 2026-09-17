@@ -123,7 +123,11 @@ export class NodeSqliteDriver implements ISqliteDriver {
   constructor(filePathOrMemory: string = ':memory:') {
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const sqliteModule = require('node:sqlite');
+      const req = typeof require !== 'undefined' ? require : undefined;
+      if (!req) {
+        throw new Error('Ambiente de execução não suporta require("node:sqlite"). Utilize BrowserSqliteDriver para o navegador.');
+      }
+      const sqliteModule = req('node:sqlite');
       this.db = new sqliteModule.DatabaseSync(filePathOrMemory);
       this.db.exec('PRAGMA foreign_keys = ON;');
       if (filePathOrMemory !== ':memory:') {
@@ -344,11 +348,176 @@ export class TauriSqliteDriver implements ISqliteDriver {
 }
 
 /**
- * Factory para obter o driver apropriado para o runtime atual (Tauri ou Node/Testes).
+ * Driver para ambiente Web/Navegador utilizando WebAssembly (sql.js / SQLite compilado para WASM).
+ * Permite execução 100% offline e local da interface do PDV no navegador durante desenvolvimento,
+ * sem requerer Node.js nativo nem o container desktop do Tauri.
+ */
+export class BrowserSqliteDriver implements ISqliteDriver {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private db: any = null;
+  private mutex = new AsyncMutex();
+  private isClosed = false;
+
+  private async ensureDb() {
+    if (this.isClosed) {
+      throw new Error('[BrowserSqliteDriver] Conexão com banco está fechada.');
+    }
+    if (!this.db) {
+      console.log('[BrowserSqliteDriver] ensureDb starting...');
+      if (typeof window !== 'undefined' && !(window as any).initSqlJs) {
+        console.log('[BrowserSqliteDriver] Loading /sql-wasm.js script...');
+        await new Promise<void>((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = '/sql-wasm.js';
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error('Falha ao carregar motor SQLite WebAssembly (/sql-wasm.js).'));
+          document.head.appendChild(script);
+        });
+      }
+
+      const initFn = typeof window !== 'undefined' ? (window as any).initSqlJs : null;
+      if (!initFn) {
+        throw new Error('[BrowserSqliteDriver] initSqlJs não está disponível no escopo.');
+      }
+
+      console.log('[BrowserSqliteDriver] Fetching /sql-wasm.wasm binary...');
+      const wasmRes = await fetch('/sql-wasm.wasm');
+      const wasmBinary = await wasmRes.arrayBuffer();
+      console.log('[BrowserSqliteDriver] WASM binary fetched (' + wasmBinary.byteLength + ' bytes), instantiating SQLite...');
+
+      const SQL = await initFn({
+        wasmBinary,
+      });
+      console.log('[BrowserSqliteDriver] SQLite WASM module initialized, creating database...');
+      this.db = new SQL.Database();
+      this.db.run('PRAGMA foreign_keys = ON;');
+      console.log('[BrowserSqliteDriver] Database successfully created and ready.');
+    }
+    return this.db;
+  }
+
+  public async execute(sql: string, params: unknown[] = []): Promise<void> {
+    const db = await this.ensureDb();
+    if (!params || params.length === 0) {
+      db.run(sql);
+    } else {
+      db.run(sql, params as any[]);
+    }
+  }
+
+  public async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+    const db = await this.ensureDb();
+    const stmt = db.prepare(sql);
+    if (params && params.length > 0) {
+      stmt.bind(params);
+    }
+    const results: T[] = [];
+    while (stmt.step()) {
+      results.push(stmt.getAsObject() as T);
+    }
+    stmt.free();
+    return results;
+  }
+
+  public async transaction<T>(fn: (tx: ISqliteDriver) => Promise<T>): Promise<T> {
+    const db = await this.ensureDb();
+    const releaseLock = await this.mutex.acquire();
+
+    try {
+      db.run('BEGIN IMMEDIATE TRANSACTION;');
+    } catch (beginErr) {
+      releaseLock();
+      const msg = beginErr instanceof Error ? beginErr.message : String(beginErr);
+      throw new Error(`[BrowserSqliteDriver] Falha ao iniciar transação: ${msg}`);
+    }
+
+    const txContext = new TransactionContextDriver(
+      async (sql, params = []) => {
+        if (!params || params.length === 0) {
+          db.run(sql);
+        } else {
+          db.run(sql, params as any[]);
+        }
+      },
+      async <K = Record<string, unknown>>(sql: string, params: unknown[] = []) => {
+        const stmt = db.prepare(sql);
+        if (params && params.length > 0) {
+          stmt.bind(params);
+        }
+        const results: K[] = [];
+        while (stmt.step()) {
+          results.push(stmt.getAsObject() as K);
+        }
+        stmt.free();
+        return results;
+      },
+      1
+    );
+
+    let result: T;
+    try {
+      result = await fn(txContext);
+    } catch (fnErr) {
+      let rollbackErr: unknown = null;
+      try {
+        db.run('ROLLBACK;');
+      } catch (rbErr) {
+        rollbackErr = rbErr;
+      }
+      releaseLock();
+
+      if (rollbackErr) {
+        const fnMsg = fnErr instanceof Error ? fnErr.message : String(fnErr);
+        const rbMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        const compositeErr = new Error(`[BrowserSqliteDriver] Transação falhou: ${fnMsg} | Rollback falhou: ${rbMsg}`);
+        (compositeErr as any).cause = fnErr;
+        (compositeErr as any).rollbackError = rollbackErr;
+        throw compositeErr;
+      }
+      throw fnErr;
+    }
+
+    try {
+      db.run('COMMIT;');
+    } catch (commitErr) {
+      let rollbackErr: unknown = null;
+      try {
+        db.run('ROLLBACK;');
+      } catch (rbErr) {
+        rollbackErr = rbErr;
+      }
+      releaseLock();
+
+      const commitMsg = commitErr instanceof Error ? commitErr.message : String(commitErr);
+      if (rollbackErr) {
+        const rbMsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        throw new Error(`[BrowserSqliteDriver] Falha no COMMIT: ${commitMsg} | Rollback falhou: ${rbMsg}`);
+      }
+      throw new Error(`[BrowserSqliteDriver] Falha no COMMIT: ${commitMsg}`);
+    }
+
+    releaseLock();
+    return result;
+  }
+
+  public async close(): Promise<void> {
+    if (this.db && !this.isClosed) {
+      this.isClosed = true;
+      this.db.close();
+      this.db = null;
+    }
+  }
+}
+
+/**
+ * Factory para obter o driver apropriado para o runtime atual (Tauri, Navegador ou Node/Testes).
  */
 export function createSqliteDriver(dbPath?: string): ISqliteDriver {
-  if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {
-    return new TauriSqliteDriver(dbPath || 'sqlite:pdv_local.db');
+  if (typeof window !== 'undefined') {
+    if ((window as any).__TAURI_INTERNALS__) {
+      return new TauriSqliteDriver(dbPath || 'sqlite:pdv_local.db');
+    }
+    return new BrowserSqliteDriver();
   }
   return new NodeSqliteDriver(dbPath || ':memory:');
 }
